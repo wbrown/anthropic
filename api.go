@@ -445,13 +445,14 @@ func (conversation *Conversation) SendUntilDone(
 		inputTokens += inputTks
 		outputTokens += outputTks
 
+		// Merge the last two assistant messages if from the assistant
+		conversation.MergeIfLastTwoAssistant()
+
 		// The only reason we would continue is if the stop reason is
 		// "max_tokens", in which case we continue the conversation
 		if stopReason != "max_tokens" {
 			done = true
 		} else {
-			// Merge the last two assistant messages if from the assistant
-			conversation.MergeIfLastTwoAssistant()
 			input = ""
 		}
 	}
