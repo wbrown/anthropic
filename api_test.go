@@ -59,3 +59,71 @@ func TestConversation_SendUntilDone(t *testing.T) {
 		t.Errorf("Expected outputTokens to not be 0")
 	}
 }
+
+// TestCacheControl tests that cache control can be added to content blocks
+func TestCacheControl(t *testing.T) {
+	// Test EnableCaching
+	block := &ContentBlock{
+		ContentType: "text",
+		Text:        stringPtr("Test content"),
+	}
+
+	block.EnableCaching()
+	if block.CacheControl == nil {
+		t.Error("Expected CacheControl to be set")
+	}
+	if block.CacheControl.Type != "ephemeral" {
+		t.Errorf("Expected CacheControl.Type to be 'ephemeral', got %s", block.CacheControl.Type)
+	}
+
+	// Test DisableCaching
+	block.DisableCaching()
+	if block.CacheControl != nil {
+		t.Error("Expected CacheControl to be nil after disabling")
+	}
+}
+
+// TestCacheStatistics tests cache statistics tracking
+func TestCacheStatistics(t *testing.T) {
+	conv := &Conversation{
+		Usage: struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		}{
+			InputTokens:  1000,
+			OutputTokens: 500,
+		},
+		CacheStats: struct {
+			TotalCacheCreationTokens int
+			TotalCacheReadTokens     int
+			TotalTokensSaved         int
+			CacheHits                int
+			CacheMisses              int
+		}{
+			TotalCacheCreationTokens: 100,
+			TotalCacheReadTokens:     900,
+			TotalTokensSaved:         810, // 900 - (900/10)
+			CacheHits:                9,
+			CacheMisses:              1,
+		},
+	}
+
+	// Test CacheHitRate
+	hitRate := conv.CacheHitRate()
+	expectedRate := 90.0 // 9 hits out of 10 total
+	if hitRate != expectedRate {
+		t.Errorf("Expected cache hit rate %.1f%%, got %.1f%%", expectedRate, hitRate)
+	}
+
+	// Test CacheSavingsRate
+	savingsRate := conv.CacheSavingsRate()
+	expectedSavings := 81.0 // 810 saved out of 1000 input tokens
+	if savingsRate != expectedSavings {
+		t.Errorf("Expected cache savings rate %.1f%%, got %.1f%%", expectedSavings, savingsRate)
+	}
+}
+
+// Helper function to create string pointers
+func stringPtr(s string) *string {
+	return &s
+}

@@ -11,6 +11,14 @@ import (
 	"time"
 )
 
+// ToolDefinition represents a tool that can be used by Claude
+type ToolDefinition struct {
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	InputSchema  json.RawMessage `json:"input_schema"`
+	CacheControl *CacheControl   `json:"cache_control,omitempty"`
+}
+
 // DefaultApiToken is set to the environment variable ANTHROPIC_API_KEY, if
 // it exists. It can be overridden by setting it directly. It is used as the
 // default API token for all conversations.
@@ -20,10 +28,10 @@ var DefaultApiToken = ""
 // as the default settings for all Conversations, and can be overridden by
 // setting it directly.
 var DefaultSettings = SampleSettings{
-	Model:       "claude-3-5-sonnet-20240620",
+	Model:       "claude-sonnet-4-20250514",
 	Version:     "2023-06-01",
-	Beta:        "", // "max-tokens-3-5-sonnet-2024-07-15"
-	MaxTokens:   4096,
+	Beta:        "", // Beta features can be enabled per conversation
+	MaxTokens:   20000,
 	Temperature: 0.0,
 }
 
@@ -51,36 +59,45 @@ type Message struct {
 	Content *[]ContentBlock `json:"content"`
 }
 
+// CacheControl specifies caching behavior for content blocks
+type CacheControl struct {
+	Type string `json:"type"`          // "ephemeral" for caching
+	TTL  string `json:"ttl,omitempty"` // "5m" or "1h" (requires beta)
+}
+
 // ContentBlock is a single block of content in a message.
 type ContentBlock struct {
-	// ContentType is the type of the content block.
-	// Possible values are:
-	//   "text": The content is a string of text.
-	//   "image": The content is an image.
-	ContentType string `json:"type"`
-	// Text is the text content.
-	Text *string `json:"text,omitempty"`
-	// Source is the source of the content.
-	Source *ContentSource `json:"source,omitempty"`
-	// tokens is the number of tokens used for the content block, it is an
-	// internally used field.
-	tokens int
+	ContentType  string           `json:"type"`
+	Text         *string          `json:"text,omitempty"`
+	Thinking     *string          `json:"thinking,omitempty"`  // For thinking content blocks
+	Signature    *string          `json:"signature,omitempty"` // For thinking block verification
+	Source       *ContentSource   `json:"source,omitempty"`
+	ID           *string          `json:"id,omitempty"`
+	Name         *string          `json:"name,omitempty"`
+	Input        *json.RawMessage `json:"input,omitempty"`
+	ToolUseID    *string          `json:"tool_use_id,omitempty"`
+	Content      *string          `json:"content,omitempty"`
+	CacheControl *CacheControl    `json:"cache_control,omitempty"`
+	tokens       int
+}
+
+// SystemPrompt represents a system prompt with optional cache control
+type SystemPrompt struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // Messages is a sequence of messages in a conversation. It usually always
 // a user message first, and alternates between user and assistant messages.
 type Messages struct {
-	// Model is the model to use for the messages.
-	Model string `json:"model"`
-	// MaxTokens is the maximum number of tokens to generate.
-	MaxTokens int `json:"max_tokens"`
-	// Temperature is the temperature to use for sampling. Ranges from 0 to 1.
-	Temperature float64 `json:"temperature"`
-	// System is the system prompt to use for the conversation.
-	System *string `json:"system"`
-	// Messages is the sequence of messages in the conversation. They must
-	// alternate between user and assistant messages.
-	Messages *[]*Message `json:"messages"`
+	Model       string           `json:"model"`
+	MaxTokens   int              `json:"max_tokens"`
+	Temperature float64          `json:"temperature"`
+	System      interface{}      `json:"system,omitempty"` // Can be string or []SystemPrompt
+	Messages    *[]*Message      `json:"messages"`
+	Tools       []ToolDefinition `json:"tools,omitempty"`
+	Thinking    *ThinkingConfig  `json:"thinking,omitempty"`
 }
 
 // ContentSource is the encoded data for the content block. It is presently
@@ -125,9 +142,11 @@ type Response struct {
 	StopSequence *string `json:"stop_sequence"`
 	// Usage is the usage statistics for the response.
 	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	}
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	} `json:"usage"`
 }
 
 // SampleSettings is used to set the settings for the request. Usually it
@@ -143,12 +162,22 @@ type SampleSettings struct {
 	MaxTokens int `json:"max_tokens"`
 	// The temperature to use for sampling.
 	Temperature float64 `json:"temperature"`
+	// Thinking configuration for extended reasoning
+	Thinking *ThinkingConfig `json:"thinking,omitempty"`
+}
+
+// ThinkingConfig configures extended thinking for Claude
+type ThinkingConfig struct {
+	Type         string `json:"type"`          // "enabled"
+	BudgetTokens int    `json:"budget_tokens"` // minimum 1024
 }
 
 // A Conversation is a sequence of messages between a user and an assistant.
 type Conversation struct {
 	// System is the system prompt to use for the conversation.
 	System *string
+	// SystemCacheable indicates if the system prompt should be cached
+	SystemCacheable bool
 	// Messages is the sequence of messages in the conversation. This always
 	// starts with a user message, and alternates between user and assistant.
 	Messages *[]*Message
@@ -157,12 +186,26 @@ type Conversation struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	}
+	// CacheStats tracks cache usage statistics
+	CacheStats struct {
+		TotalCacheCreationTokens int
+		TotalCacheReadTokens     int
+		TotalTokensSaved         int
+		CacheHits                int
+		CacheMisses              int
+	}
 	// HttpClient is the HTTP client used for API requests
 	HttpClient *http.Client
 	// apiToken is the API token used for API requests
 	ApiToken string `json:"-"`
 	// Settings is the settings for the conversation.
 	Settings *SampleSettings
+	// Tools are optional tool definitions for the conversation
+	Tools []ToolDefinition
+	// ToolsCacheable indicates if tools should be cached
+	ToolsCacheable bool
+	// HasThinkingContent tracks if any responses included thinking blocks
+	HasThinkingContent bool
 }
 
 // NewConversation creates a new conversation with the given system prompt. It
@@ -200,9 +243,9 @@ func (conversation *Conversation) AddMessage(
 	*conversation.Messages = append(*conversation.Messages, &message)
 }
 
-// Messages API URI
-// POST /v1/messages
+// API URIs
 var messagesURI = "https://api.anthropic.com/v1/messages"
+var modelsURI = "https://api.anthropic.com/v1/models"
 
 // API default headers
 var headers = map[string]string{
@@ -248,18 +291,59 @@ func (conversation *Conversation) Send(text string) (
 	} else if len(*conversation.Messages) > 2 &&
 		(*conversation.Messages)[len(*conversation.Messages)-1].Role !=
 			"assistant" {
-		// If the text is empty, and the last message is not from the
-		// assistant, we can't continue the conversation, so return
-		return "", "", 0, 0,
-			fmt.Errorf("cannot continue conversation")
+		// Check if the last user message contains tool results
+		lastMsg := (*conversation.Messages)[len(*conversation.Messages)-1]
+		if lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0 {
+			// Check if this is a tool result message
+			hasToolResult := false
+			for _, block := range *lastMsg.Content {
+				if block.ContentType == "tool_result" {
+					hasToolResult = true
+					break
+				}
+			}
+			if !hasToolResult {
+				// If the text is empty, and the last message is not from the
+				// assistant, we can't continue the conversation, so return
+				return "", "", 0, 0,
+					fmt.Errorf("cannot continue conversation")
+			}
+			// If it's a tool result, allow continuation
+		} else {
+			return "", "", 0, 0,
+				fmt.Errorf("cannot continue conversation")
+		}
 	}
+
+	// Build system prompt with cache control if needed
+	var system interface{}
+	if conversation.System != nil && *conversation.System != "" {
+		if conversation.SystemCacheable {
+			// Use array format with cache control
+			system = []SystemPrompt{{
+				Type:         "text",
+				Text:         *conversation.System,
+				CacheControl: &CacheControl{Type: "ephemeral", TTL: "1h"},
+			}}
+		} else {
+			// Use simple string format
+			system = conversation.System
+		}
+	}
+
+	// Build tools with cache control if needed
+	tools := conversation.Tools
+	// Note: The API doesn't support caching individual tools, only the entire tools array
+	// Tool caching is handled at the API level, not per-tool
 
 	messages := Messages{
 		Model:       conversation.Settings.Model,
 		MaxTokens:   conversation.Settings.MaxTokens,
 		Temperature: conversation.Settings.Temperature,
-		System:      conversation.System,
+		System:      system,
 		Messages:    conversation.Messages,
+		Tools:       tools,
+		Thinking:    conversation.Settings.Thinking,
 	}
 
 	// Marshal messages to JSON
@@ -267,6 +351,11 @@ func (conversation *Conversation) Send(text string) (
 	if marshalErr != nil {
 		return "", "", 0, 0,
 			fmt.Errorf("error marshalling to JSON: %s", marshalErr)
+	}
+
+	// Debug: Log request if ANTHROPIC_DEBUG is set
+	if os.Getenv("ANTHROPIC_DEBUG") == "true" {
+		fmt.Printf("DEBUG: Request thinking config: %+v\n", messages.Thinking)
 	}
 
 	req, err := http.NewRequest("POST", messagesURI,
@@ -318,13 +407,24 @@ func (conversation *Conversation) Send(text string) (
 			fmt.Errorf("error reading response body: %s", bodyErr)
 	}
 
+	// Check response status first
+	if resp.StatusCode != http.StatusOK {
+		return "", "", 0, 0,
+			fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+
 	// Deserialize response
 	var response Response
 	if jsonErr := json.Unmarshal(bodyBytes, &response); jsonErr != nil {
-		return string(bodyBytes), "", 0, 0,
-			fmt.Errorf(
-				"error unmarshaling response, body is in `reply`: %s",
-				jsonErr)
+		// Check if response looks like HTML
+		bodyStr := string(bodyBytes)
+		if strings.HasPrefix(strings.TrimSpace(bodyStr), "<") {
+			// Likely an HTML error page
+			return "", "", 0, 0,
+				fmt.Errorf("received HTML error page from API (status %d)", resp.StatusCode)
+		}
+		return "", "", 0, 0,
+			fmt.Errorf("error unmarshaling JSON response: %s", jsonErr)
 	}
 	if response.MessageType == "error" {
 		return string(bodyBytes), "", 0, 0,
@@ -332,14 +432,36 @@ func (conversation *Conversation) Send(text string) (
 	}
 
 	reply = ""
-	// Add responses to conversation
+	// Set tokens on all content blocks before adding
+	for i := range *response.Content {
+		(*response.Content)[i].tokens = response.Usage.OutputTokens
+	}
+
+	// Add ALL response content as a single message
+	conversation.AddMessage("assistant", response.Content)
+
+	// Build reply from text and thinking content blocks
+	var hasThinking bool
 	for _, contentBlock := range *response.Content {
-		if contentBlock.Text != nil {
-			contentBlock.tokens = response.Usage.OutputTokens
-			conversation.AddMessage("assistant",
-				&[]ContentBlock{contentBlock})
-			// Currently, the API only produces text content
+		// Debug: Log all content block types
+		if os.Getenv("ANTHROPIC_DEBUG") == "true" {
+			fmt.Printf("DEBUG: Content block type: %s\n", contentBlock.ContentType)
+		}
+
+		if contentBlock.ContentType == "text" && contentBlock.Text != nil {
 			reply += *contentBlock.Text
+		} else if contentBlock.ContentType == "thinking" && contentBlock.Thinking != nil {
+			// Include thinking in the reply with tags
+			reply += "<thinking>\n" + *contentBlock.Thinking + "\n</thinking>\n"
+			hasThinking = true
+		}
+	}
+
+	// Track if we've seen thinking content
+	if hasThinking {
+		conversation.HasThinkingContent = true
+		if os.Getenv("ANTHROPIC_DEBUG") == "true" {
+			fmt.Println("DEBUG: Found thinking blocks in response")
 		}
 	}
 
@@ -358,6 +480,22 @@ func (conversation *Conversation) Send(text string) (
 	// Add usage statistics to conversation
 	conversation.Usage.InputTokens += response.Usage.InputTokens
 	conversation.Usage.OutputTokens += response.Usage.OutputTokens
+
+	// Update cache statistics
+	if response.Usage.CacheCreationInputTokens > 0 {
+		conversation.CacheStats.TotalCacheCreationTokens += response.Usage.CacheCreationInputTokens
+		conversation.CacheStats.CacheMisses++
+	}
+
+	if response.Usage.CacheReadInputTokens > 0 {
+		conversation.CacheStats.TotalCacheReadTokens += response.Usage.CacheReadInputTokens
+		conversation.CacheStats.CacheHits++
+
+		// Calculate savings (cache reads are 90% cheaper)
+		regularCost := response.Usage.CacheReadInputTokens
+		cacheCost := regularCost / 10
+		conversation.CacheStats.TotalTokensSaved += (regularCost - cacheCost)
+	}
 
 	return reply,
 		response.StopReason,
@@ -465,6 +603,182 @@ func init() {
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, "ANTHROPIC_API_KEY=") {
 			DefaultApiToken = strings.Split(e, "=")[1]
+		}
+	}
+}
+
+// Helper methods for cache control
+
+// EnableCaching adds cache control to a content block (5-minute TTL by default)
+func (cb *ContentBlock) EnableCaching() {
+	cb.CacheControl = &CacheControl{Type: "ephemeral"}
+}
+
+// EnableLongCaching adds cache control with 1-hour TTL (requires beta)
+func (cb *ContentBlock) EnableLongCaching() {
+	cb.CacheControl = &CacheControl{Type: "ephemeral", TTL: "1h"}
+}
+
+// DisableCaching removes cache control from a content block
+func (cb *ContentBlock) DisableCaching() {
+	cb.CacheControl = nil
+}
+
+// CacheHitRate returns the cache hit rate as a percentage
+func (c *Conversation) CacheHitRate() float64 {
+	total := c.CacheStats.CacheHits + c.CacheStats.CacheMisses
+	if total == 0 {
+		return 0
+	}
+	return float64(c.CacheStats.CacheHits) / float64(total) * 100
+}
+
+// CacheSavingsRate returns the percentage of tokens saved by caching
+func (c *Conversation) CacheSavingsRate() float64 {
+	if c.Usage.InputTokens == 0 {
+		return 0
+	}
+	return float64(c.CacheStats.TotalTokensSaved) / float64(c.Usage.InputTokens) * 100
+}
+
+// Beta feature management
+
+// EnableBeta adds a beta feature to the conversation settings
+func (c *Conversation) EnableBeta(beta string) {
+	if c.Settings == nil {
+		settings := DefaultSettings
+		c.Settings = &settings
+	}
+
+	if c.Settings.Beta == "" {
+		c.Settings.Beta = beta
+	} else if !strings.Contains(c.Settings.Beta, beta) {
+		// Add comma-separated beta
+		c.Settings.Beta = c.Settings.Beta + "," + beta
+	}
+}
+
+// DisableBeta removes a beta feature from the conversation settings
+func (c *Conversation) DisableBeta(beta string) {
+	if c.Settings == nil || c.Settings.Beta == "" {
+		return
+	}
+
+	// Split existing betas
+	betas := strings.Split(c.Settings.Beta, ",")
+	var newBetas []string
+
+	for _, b := range betas {
+		b = strings.TrimSpace(b)
+		if b != beta {
+			newBetas = append(newBetas, b)
+		}
+	}
+
+	c.Settings.Beta = strings.Join(newBetas, ",")
+}
+
+// EnableThinking enables extended thinking with the specified token budget
+func (c *Conversation) EnableThinking(budgetTokens int) {
+	if c.Settings == nil {
+		settings := DefaultSettings
+		c.Settings = &settings
+	}
+
+	if budgetTokens < 1024 {
+		budgetTokens = 1024 // Minimum required
+	}
+	c.Settings.Thinking = &ThinkingConfig{
+		Type:         "enabled",
+		BudgetTokens: budgetTokens,
+	}
+}
+
+// Model represents an available Claude model
+type Model struct {
+	Type        string    `json:"type"`
+	ID          string    `json:"id"`
+	DisplayName string    `json:"display_name"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// ModelsResponse represents the response from the models list API
+type ModelsResponse struct {
+	Data    []Model `json:"data"`
+	FirstID string  `json:"first_id"`
+	LastID  string  `json:"last_id"`
+	HasMore bool    `json:"has_more"`
+}
+
+// ListModels retrieves the list of available models
+func ListModels(apiKey string) (*ModelsResponse, error) {
+	if apiKey == "" {
+		apiKey = DefaultApiToken
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("API key not provided")
+	}
+
+	req, err := http.NewRequest("GET", modelsURI, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", DefaultSettings.Version)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, body)
+	}
+
+	var modelsResp ModelsResponse
+	if err := json.Unmarshal(body, &modelsResp); err != nil {
+		return nil, fmt.Errorf("error parsing response: %w", err)
+	}
+
+	return &modelsResp, nil
+}
+
+// EnableSystemCaching enables caching for the system prompt
+func (c *Conversation) EnableSystemCaching() {
+	c.SystemCacheable = true
+}
+
+// EnableToolsCaching enables caching for tool definitions
+func (c *Conversation) EnableToolsCaching() {
+	c.ToolsCacheable = true
+}
+
+// CacheLastNMessages enables caching on the last N messages
+// This is useful for caching accumulated tool results
+func (c *Conversation) CacheLastNMessages(n int) {
+	if c.Messages == nil || len(*c.Messages) == 0 {
+		return
+	}
+
+	messages := *c.Messages
+	start := len(messages) - n
+	if start < 0 {
+		start = 0
+	}
+
+	for i := start; i < len(messages); i++ {
+		if messages[i].Content != nil {
+			for j := range *messages[i].Content {
+				(*messages[i].Content)[j].EnableCaching()
+			}
 		}
 	}
 }
