@@ -1,15 +1,22 @@
 package anthropic
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/wbrown/llmapi"
 )
+
+// Compile-time interface check
+var _ llmapi.Conversation = (*Conversation)(nil)
 
 // ToolDefinition represents a tool that can be used by Claude
 type ToolDefinition struct {
@@ -94,10 +101,13 @@ type Messages struct {
 	Model       string           `json:"model"`
 	MaxTokens   int              `json:"max_tokens"`
 	Temperature float64          `json:"temperature"`
+	TopP        float64          `json:"top_p,omitempty"`
+	TopK        int              `json:"top_k,omitempty"`
 	System      interface{}      `json:"system,omitempty"` // Can be string or []SystemPrompt
 	Messages    *[]*Message      `json:"messages"`
 	Tools       []ToolDefinition `json:"tools,omitempty"`
 	Thinking    *ThinkingConfig  `json:"thinking,omitempty"`
+	Stream      bool             `json:"stream,omitempty"`
 }
 
 // ContentSource is the encoded data for the content block. It is presently
@@ -149,6 +159,44 @@ type Response struct {
 	} `json:"usage"`
 }
 
+// Streaming response types for SSE parsing
+//
+// Anthropic's streaming API sends Server-Sent Events (SSE) with these event types:
+//   - message_start: Contains initial message metadata and input token count
+//   - content_block_start: Signals the start of a content block
+//   - content_block_delta: Contains incremental text updates
+//   - content_block_stop: Signals the end of a content block
+//   - message_delta: Contains final stop_reason and output token count
+//   - message_stop: Signals stream completion
+
+// StreamEvent represents an SSE event from the Anthropic streaming API.
+// The Type field corresponds to the SSE event name, and other fields are
+// populated based on the event type.
+type StreamEvent struct {
+	Type    string        `json:"type"`
+	Message *Response     `json:"message,omitempty"`       // Populated in message_start
+	Index   int           `json:"index,omitempty"`         // Content block index
+	Delta   *StreamDelta  `json:"delta,omitempty"`         // Populated in content_block_delta and message_delta
+	Usage   *StreamUsage  `json:"usage,omitempty"`         // Populated in message_delta
+	Content *ContentBlock `json:"content_block,omitempty"` // Populated in content_block_start
+}
+
+// StreamDelta contains incremental content updates from streaming responses.
+// For content_block_delta events, Text contains the new text fragment.
+// For message_delta events, StopReason contains the final stop reason.
+type StreamDelta struct {
+	Type       string  `json:"type,omitempty"`
+	Text       string  `json:"text,omitempty"`
+	StopReason *string `json:"stop_reason,omitempty"`
+}
+
+// StreamUsage contains token usage information from streaming responses.
+// This is sent in the message_delta event at the end of the stream.
+type StreamUsage struct {
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens,omitempty"`
+}
+
 // SampleSettings is used to set the settings for the request. Usually it
 // pertains to samplers.
 type SampleSettings struct {
@@ -158,10 +206,14 @@ type SampleSettings struct {
 	Version string `json:"version"`
 	// Beta is the beta version of the model to use for the sample.
 	Beta string `json:"beta"`
-	// MaxTokens is the mas number of tokens to generate.
+	// MaxTokens is the max number of tokens to generate.
 	MaxTokens int `json:"max_tokens"`
-	// The temperature to use for sampling.
+	// Temperature to use for sampling (0.0-1.0).
 	Temperature float64 `json:"temperature"`
+	// TopP for nucleus sampling (0.0-1.0). Use either Temperature or TopP, not both.
+	TopP float64 `json:"top_p,omitempty"`
+	// TopK limits sampling to the top K tokens.
+	TopK int `json:"top_k,omitempty"`
 	// Thinking configuration for extended reasoning
 	Thinking *ThinkingConfig `json:"thinking,omitempty"`
 }
@@ -208,56 +260,6 @@ type Conversation struct {
 	HasThinkingContent bool
 }
 
-// NewConversation creates a new conversation with the given system prompt. It
-// initializes the messages and usage statistics, as well as reasonable
-// defaults.
-func NewConversation(system string) *Conversation {
-	messages := make([]*Message, 0)
-	conversation := Conversation{
-		System:   &system,
-		Messages: &messages,
-	}
-	conversation.Usage.OutputTokens = 0
-	conversation.Usage.InputTokens = 0
-	// Copy our default settings
-	settings := DefaultSettings
-	conversation.Settings = &settings
-	conversation.ApiToken = DefaultApiToken
-
-	// Initialize the HTTP client
-	conversation.HttpClient = &http.Client{}
-	return &conversation
-}
-
-// AddMessage adds a message to the conversation with the given role and
-// content. It used internally, and also can be used externally to
-// manipulate conversations.
-func (conversation *Conversation) AddMessage(
-	role string,
-	content *[]ContentBlock,
-) {
-	message := Message{
-		Role:    role,
-		Content: content,
-	}
-	*conversation.Messages = append(*conversation.Messages, &message)
-}
-
-// API URIs
-var messagesURI = "https://api.anthropic.com/v1/messages"
-var modelsURI = "https://api.anthropic.com/v1/models"
-
-// API default headers
-var headers = map[string]string{
-	"Content-Type":      "application/json",
-	"x-api-key":         "",
-	"anthropic_version": "2023-06-01",
-	// "anthropic-beta":    "max-tokens-3-5-sonnet-2024-07-15",
-}
-
-var retries = 3
-var retryDelay = 3 * time.Second
-
 // Send sends a message to the assistant and returns the reply. It also
 // returns the reason the conversation stopped, the number of input tokens
 // used, and the number of output tokens used.
@@ -265,13 +267,7 @@ var retryDelay = 3 * time.Second
 // If the text is empty, it sends the message as is, and does not add a user
 // message to the conversation. This is useful for continuing an incomplete
 // conversation by "assistant", in the case of a stopReason of "max_tokens".
-func (conversation *Conversation) Send(text string) (
-	reply string,
-	stopReason string,
-	inputTokens int,
-	outputTokens int,
-	err error,
-) {
+func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens int, err error) {
 	if conversation.Settings == nil {
 		return "", "", 0, 0,
 			fmt.Errorf("conversation settings not set")
@@ -281,13 +277,7 @@ func (conversation *Conversation) Send(text string) (
 			fmt.Errorf("API token not set")
 	}
 	if text != "" {
-		// Form a basic message
-		contentBlock := ContentBlock{
-			ContentType: "text",
-			Text:        &text,
-		}
-		// Add message to conversation
-		conversation.AddMessage("user", &[]ContentBlock{contentBlock})
+		conversation.AddMessage("user", text)
 	} else if len(*conversation.Messages) > 2 &&
 		(*conversation.Messages)[len(*conversation.Messages)-1].Role !=
 			"assistant" {
@@ -336,10 +326,26 @@ func (conversation *Conversation) Send(text string) (
 	// Note: The API doesn't support caching individual tools, only the entire tools array
 	// Tool caching is handled at the API level, not per-tool
 
+	// Use sampling overrides if provided (non-zero), otherwise use conversation defaults
+	temperature := conversation.Settings.Temperature
+	if sampling.Temperature != 0 {
+		temperature = sampling.Temperature
+	}
+	topP := conversation.Settings.TopP
+	if sampling.TopP != 0 {
+		topP = sampling.TopP
+	}
+	topK := conversation.Settings.TopK
+	if sampling.TopK != 0 {
+		topK = sampling.TopK
+	}
+
 	messages := Messages{
 		Model:       conversation.Settings.Model,
 		MaxTokens:   conversation.Settings.MaxTokens,
-		Temperature: conversation.Settings.Temperature,
+		Temperature: temperature,
+		TopP:        topP,
+		TopK:        topK,
 		System:      system,
 		Messages:    conversation.Messages,
 		Tools:       tools,
@@ -437,8 +443,16 @@ func (conversation *Conversation) Send(text string) (
 		(*response.Content)[i].tokens = response.Usage.OutputTokens
 	}
 
+	var responseText string
+
+	for i := range *response.Content {
+		if (*response.Content)[i].ContentType == "text" {
+			responseText = *(*response.Content)[i].Text
+		}
+	}
+
 	// Add ALL response content as a single message
-	conversation.AddMessage("assistant", response.Content)
+	conversation.AddMessage("assistant", responseText)
 
 	// Build reply from text and thinking content blocks
 	var hasThinking bool
@@ -504,6 +518,448 @@ func (conversation *Conversation) Send(text string) (
 		nil
 }
 
+// SendStreaming sends a message with real-time token streaming via SSE.
+// The callback is invoked for each text fragment received from the API.
+//
+// Parameters:
+//   - text: The user message to send. If empty, continues from the last message.
+//   - sampling: Sampling parameters (currently unused, reserved for future use).
+//   - callback: Called with each text fragment; called with ("", true) when done.
+//
+// Returns the same values as Send, but tokens are streamed via callback as they arrive.
+func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sampling, callback llmapi.StreamCallback) (reply, stopReason string, inputTokens, outputTokens int, err error) {
+	if conversation.Settings == nil {
+		return "", "", 0, 0, fmt.Errorf("conversation settings not set")
+	}
+	if conversation.ApiToken == "" {
+		return "", "", 0, 0, fmt.Errorf("API token not set")
+	}
+
+	// Add user message if provided
+	if text != "" {
+		conversation.AddMessage("user", text)
+	} else if len(*conversation.Messages) > 0 &&
+		(*conversation.Messages)[len(*conversation.Messages)-1].Role != "assistant" {
+		// Check if the last user message contains tool results
+		lastMsg := (*conversation.Messages)[len(*conversation.Messages)-1]
+		if lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0 {
+			hasToolResult := false
+			for _, block := range *lastMsg.Content {
+				if block.ContentType == "tool_result" {
+					hasToolResult = true
+					break
+				}
+			}
+			if !hasToolResult {
+				return "", "", 0, 0, fmt.Errorf("cannot continue conversation")
+			}
+		} else {
+			return "", "", 0, 0, fmt.Errorf("cannot continue conversation")
+		}
+	}
+
+	// Build system prompt with cache control if needed
+	var system interface{}
+	if conversation.System != nil && *conversation.System != "" {
+		if conversation.SystemCacheable {
+			system = []SystemPrompt{{
+				Type:         "text",
+				Text:         *conversation.System,
+				CacheControl: &CacheControl{Type: "ephemeral", TTL: "1h"},
+			}}
+		} else {
+			system = conversation.System
+		}
+	}
+
+	// Use sampling overrides if provided (non-zero), otherwise use conversation defaults
+	temperature := conversation.Settings.Temperature
+	if sampling.Temperature != 0 {
+		temperature = sampling.Temperature
+	}
+	topP := conversation.Settings.TopP
+	if sampling.TopP != 0 {
+		topP = sampling.TopP
+	}
+	topK := conversation.Settings.TopK
+	if sampling.TopK != 0 {
+		topK = sampling.TopK
+	}
+
+	messages := Messages{
+		Model:       conversation.Settings.Model,
+		MaxTokens:   conversation.Settings.MaxTokens,
+		Temperature: temperature,
+		TopP:        topP,
+		TopK:        topK,
+		System:      system,
+		Messages:    conversation.Messages,
+		Tools:       conversation.Tools,
+		Thinking:    conversation.Settings.Thinking,
+		Stream:      true,
+	}
+
+	jsonData, marshalErr := json.Marshal(messages)
+	if marshalErr != nil {
+		return "", "", 0, 0, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
+	}
+
+	req, err := http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("error creating HTTP request: %s", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", conversation.ApiToken)
+	req.Header.Set("anthropic-version", conversation.Settings.Version)
+	req.Header.Set("Accept", "text/event-stream")
+	if conversation.Settings.Beta != "" {
+		req.Header.Set("anthropic-beta", conversation.Settings.Beta)
+	}
+
+	// Use a client without timeout for streaming
+	client := &http.Client{Timeout: 0}
+	if conversation.HttpClient != nil && conversation.HttpClient.Transport != nil {
+		client.Transport = conversation.HttpClient.Transport
+	}
+
+	// Perform request with retries
+	var resp *http.Response
+	for attempt := 0; attempt <= retries; attempt++ {
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt < retries {
+			time.Sleep(retryDelay)
+			req, _ = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-api-key", conversation.ApiToken)
+			req.Header.Set("anthropic-version", conversation.Settings.Version)
+			req.Header.Set("Accept", "text/event-stream")
+			if conversation.Settings.Beta != "" {
+				req.Header.Set("anthropic-beta", conversation.Settings.Beta)
+			}
+		}
+	}
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("HTTP error after %d retries: %s", retries, err)
+	}
+	if resp == nil {
+		return "", "", 0, 0, fmt.Errorf("HTTP response is nil")
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			log.Printf("error closing response body: %v", err)
+		}
+	}(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", "", 0, 0, fmt.Errorf("API error (status %d): %s", resp.StatusCode, body)
+	}
+
+	// Parse SSE stream
+	reply, stopReason, inputTokens, outputTokens, err = conversation.parseSSEStream(resp.Body, callback)
+	if err != nil {
+		return reply, stopReason, inputTokens, outputTokens, err
+	}
+
+	// Add assistant message to history
+	conversation.AddMessage("assistant", reply)
+
+	// Update usage statistics
+	conversation.Usage.InputTokens += inputTokens
+	conversation.Usage.OutputTokens += outputTokens
+
+	return reply, stopReason, inputTokens, outputTokens, nil
+}
+
+// parseSSEStream reads Server-Sent Events from the response body and processes them.
+// It extracts text deltas, token counts, and stop reason from the stream.
+//
+// SSE format from Anthropic:
+//
+//	event: message_start
+//	data: {"type":"message_start","message":{...}}
+//
+//	event: content_block_delta
+//	data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
+//
+//	event: message_delta
+//	data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}
+//
+//	event: message_stop
+//	data: {"type":"message_stop"}
+func (conversation *Conversation) parseSSEStream(body io.Reader, callback llmapi.StreamCallback) (
+	fullText string,
+	stopReason string,
+	inputTokens int,
+	outputTokens int,
+	err error,
+) {
+	scanner := bufio.NewScanner(body)
+	var accumulated strings.Builder
+	var currentEvent string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// SSE events come as "event: <name>" followed by "data: <json>"
+		if strings.HasPrefix(line, "event: ") {
+			currentEvent = strings.TrimPrefix(line, "event: ")
+			continue
+		}
+
+		// Skip non-data lines (empty lines, comments, etc.)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+
+		var event StreamEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			// Skip malformed events rather than failing the whole stream
+			continue
+		}
+
+		switch currentEvent {
+		case "message_start":
+			// Initial event contains input token count
+			if event.Message != nil {
+				inputTokens = event.Message.Usage.InputTokens
+			}
+
+		case "content_block_delta":
+			// Text fragments arrive here - invoke callback for real-time display
+			if event.Delta != nil && event.Delta.Text != "" {
+				accumulated.WriteString(event.Delta.Text)
+				if callback != nil {
+					callback(event.Delta.Text, false)
+				}
+			}
+
+		case "message_delta":
+			// Final event before message_stop - contains stop reason and output tokens
+			if event.Delta != nil && event.Delta.StopReason != nil {
+				stopReason = *event.Delta.StopReason
+			}
+			if event.Usage != nil {
+				outputTokens = event.Usage.OutputTokens
+			}
+
+		case "message_stop":
+			// Stream complete - signal done to callback
+			if callback != nil {
+				callback("", true)
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return accumulated.String(), stopReason, inputTokens, outputTokens, fmt.Errorf("error reading stream: %w", err)
+	}
+
+	return accumulated.String(), stopReason, inputTokens, outputTokens, nil
+}
+
+func (conversation *Conversation) SendUntilDone(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens int, err error) {
+	var output = ""
+	done := false
+	input := text
+	for !done {
+		var inputTks, outputTks int
+		var reply string
+
+		reply, stopReason, inputTks, outputTks, err =
+			conversation.Send(input, sampling)
+		if err != nil {
+			return output, stopReason, inputTokens, outputTokens, err
+		}
+
+		// Accumulate the output and token counts
+		output += reply
+		inputTokens += inputTks
+		outputTokens += outputTks
+
+		// Merge the last two assistant messages if from the assistant
+		conversation.MergeIfLastTwoAssistant()
+
+		// The only reason we would continue is if the stop reason is
+		// "max_tokens", in which case we continue the conversation
+		if stopReason != "max_tokens" {
+			done = true
+		} else {
+			input = ""
+		}
+	}
+	return output, stopReason, inputTokens, outputTokens, nil
+}
+
+// SendStreamingUntilDone combines streaming with automatic continuation.
+// It calls SendStreaming repeatedly until stopReason != "max_tokens",
+// streaming tokens via callback throughout the entire generation.
+//
+// This is useful for long responses that exceed max_tokens - the callback
+// receives a continuous stream of tokens across all continuation requests,
+// while the returned reply contains the complete accumulated response.
+//
+// Consecutive assistant messages are automatically merged in the conversation
+// history to maintain a clean message structure.
+func (conversation *Conversation) SendStreamingUntilDone(text string, sampling llmapi.Sampling, callback llmapi.StreamCallback) (reply, stopReason string, inputTokens, outputTokens int, err error) {
+	var totalReply strings.Builder
+	input := text
+
+	for {
+		var partReply string
+		var inToks, outToks int
+
+		partReply, stopReason, inToks, outToks, err = conversation.SendStreaming(input, sampling, callback)
+		if err != nil {
+			return totalReply.String(), stopReason, inputTokens, outputTokens, err
+		}
+
+		totalReply.WriteString(partReply)
+		inputTokens += inToks
+		outputTokens += outToks
+
+		// Merge consecutive assistant messages to keep history clean
+		conversation.MergeIfLastTwoAssistant()
+
+		if stopReason != "max_tokens" {
+			break
+		}
+
+		// Continue generation with empty input (picks up from last assistant message)
+		input = ""
+	}
+
+	return totalReply.String(), stopReason, inputTokens, outputTokens, nil
+}
+
+// AddMessage adds a message to the conversation with the given role and
+// content. It used internally, and also can be used externally to
+// manipulate conversations.
+func (conversation *Conversation) AddMessage(role, content string) {
+
+	if content != "" {
+		contentBlock := ContentBlock{
+			ContentType: "text",
+			Text:        &content,
+		}
+		message := Message{
+			Role:    role,
+			Content: &[]ContentBlock{contentBlock},
+		}
+
+		*conversation.Messages = append(*conversation.Messages, &message)
+	}
+
+}
+
+// GetMessages returns the conversation history as llmapi.Message slices.
+// This converts from the internal ContentBlock-based format to simple
+// role/content strings for interface compliance.
+//
+// Note: Only the first text content block from each message is extracted.
+// Tool use, images, and other content types are not included in the output.
+func (conversation *Conversation) GetMessages() []llmapi.Message {
+	if conversation.Messages == nil {
+		return nil
+	}
+	result := make([]llmapi.Message, 0, len(*conversation.Messages))
+	for _, msg := range *conversation.Messages {
+		var content string
+		if msg.Content != nil && len(*msg.Content) > 0 {
+			// Extract text from first text content block
+			for _, block := range *msg.Content {
+				if block.ContentType == "text" && block.Text != nil {
+					content = *block.Text
+					break
+				}
+			}
+		}
+		result = append(result, llmapi.Message{
+			Role:    msg.Role,
+			Content: content,
+		})
+	}
+	return result
+}
+
+// GetUsage returns the cumulative token usage for this conversation.
+// This includes all input and output tokens across all Send calls.
+func (conversation *Conversation) GetUsage() llmapi.Usage {
+	return llmapi.Usage{
+		InputTokens:  conversation.Usage.InputTokens,
+		OutputTokens: conversation.Usage.OutputTokens,
+	}
+}
+
+// GetSystem returns the system prompt for this conversation.
+func (conversation *Conversation) GetSystem() string {
+	if conversation.System == nil {
+		return ""
+	}
+	return *conversation.System
+}
+
+// Clear resets the conversation history and usage statistics.
+// The system prompt and settings are preserved.
+func (conversation *Conversation) Clear() {
+	messages := make([]*Message, 0)
+	conversation.Messages = &messages
+	conversation.Usage.InputTokens = 0
+	conversation.Usage.OutputTokens = 0
+}
+
+// SetModel changes the model for subsequent API calls.
+// If settings haven't been initialized, they are created from DefaultSettings.
+func (conversation *Conversation) SetModel(model string) {
+	if conversation.Settings == nil {
+		settings := DefaultSettings
+		conversation.Settings = &settings
+	}
+	conversation.Settings.Model = model
+}
+
+// NewConversation creates a new conversation with the given system prompt. It
+// initializes the messages and usage statistics, as well as reasonable
+// defaults.
+func NewConversation(system string) *Conversation {
+	messages := make([]*Message, 0)
+	conversation := Conversation{
+		System:   &system,
+		Messages: &messages,
+	}
+	conversation.Usage.OutputTokens = 0
+	conversation.Usage.InputTokens = 0
+	// Copy our default settings
+	settings := DefaultSettings
+	conversation.Settings = &settings
+	conversation.ApiToken = DefaultApiToken
+
+	// Initialize the HTTP client
+	conversation.HttpClient = &http.Client{}
+	return &conversation
+}
+
+// API URIs
+var messagesURI = "https://api.anthropic.com/v1/messages"
+var modelsURI = "https://api.anthropic.com/v1/models"
+
+// API default headers (currently unused - headers are set inline in Send/SendStreaming)
+// var headers = map[string]string{
+// 	"Content-Type":      "application/json",
+// 	"x-api-key":         "",
+// 	"anthropic_version": "2023-06-01",
+// 	// "anthropic-beta":    "max-tokens-3-5-sonnet-2024-07-15",
+// }
+
+var retries = 3
+var retryDelay = 3 * time.Second
+
 // MergeIfLastTwoAssistant merges the last two assistant messages if they are
 // both from the assistant. This is useful for combining messages that are
 // split and continued due to token limits.
@@ -551,60 +1007,48 @@ func (conversation *Conversation) MergeIfLastTwoAssistant() {
 	*conversation.Messages = (*conversation.Messages)[:lastIdx]
 }
 
-// SendUntilDone sends a message to the assistant, and continues sending
-// messages until the conversation is done. It returns the full output
-// text, the reason the conversation stopped, the total number of input
-// tokens used, the total number of output tokens used, and any error that
-// occurred.
-func (conversation *Conversation) SendUntilDone(
-	text string,
-) (
-	output string,
-	stopReason string,
-	inputTokens int,
-	outputTokens int,
-	err error,
-) {
-	output = ""
-	done := false
-	input := text
-	for !done {
-		var inputTks, outputTks int
-		var reply string
+//func (conversation *Conversation) SendUntilDone(
+//	text string,
+//) (
+//	output string,
+//	stopReason string,
+//	inputTokens int,
+//	outputTokens int,
+//	err error,
+//) {
+//
+//}
 
-		reply, stopReason, inputTks, outputTks, err =
-			conversation.Send(input)
-		if err != nil {
-			return output, stopReason, inputTokens, outputTokens, err
-		}
+// init loads the API token from token files or environment variable.
+// Priority: ./.anthropic_key > ~/.anthropic_key > ANTHROPIC_API_KEY env var
+func init() {
+	// 1. Current directory token file (highest priority)
+	if token := readTokenFile(".anthropic_key"); token != "" {
+		DefaultApiToken = token
+		return
+	}
 
-		// Accumulate the output and token counts
-		output += reply
-		inputTokens += inputTks
-		outputTokens += outputTks
-
-		// Merge the last two assistant messages if from the assistant
-		conversation.MergeIfLastTwoAssistant()
-
-		// The only reason we would continue is if the stop reason is
-		// "max_tokens", in which case we continue the conversation
-		if stopReason != "max_tokens" {
-			done = true
-		} else {
-			input = ""
+	// 2. Home directory token file
+	if home, err := os.UserHomeDir(); err == nil {
+		if token := readTokenFile(home + "/.anthropic_key"); token != "" {
+			DefaultApiToken = token
+			return
 		}
 	}
-	return output, stopReason, inputTokens, outputTokens, nil
+
+	// 3. Environment variable (lowest priority)
+	if token := os.Getenv("ANTHROPIC_API_KEY"); token != "" {
+		DefaultApiToken = token
+	}
 }
 
-// Obtain API key from environment variable
-func init() {
-	// Check for API key in environment variable
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "ANTHROPIC_API_KEY=") {
-			DefaultApiToken = strings.Split(e, "=")[1]
-		}
+// readTokenFile reads a token from a file, returning empty string on error.
+func readTokenFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
 	}
+	return strings.TrimSpace(string(data))
 }
 
 // Helper methods for cache control
@@ -732,7 +1176,12 @@ func ListModels(apiKey string) (*ModelsResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error making request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			log.Printf("error closing response body: %v", err)
+		}
+	}(resp.Body)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

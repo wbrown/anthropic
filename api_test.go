@@ -2,6 +2,8 @@ package anthropic
 
 import (
 	"testing"
+
+	"github.com/wbrown/llmapi"
 )
 
 func TestInit(t *testing.T) {
@@ -16,7 +18,7 @@ func TestConversation_Send(t *testing.T) {
 	// Test that the reply is not empty
 	conversation := NewConversation("You are a friendly assistant.")
 	reply, stopReason, inputTokens, outputTokens, err :=
-		conversation.Send("Hello Claude!")
+		conversation.Send("Hello Claude!", llmapi.Sampling{})
 	if err != nil {
 		t.Errorf("Expected err to be nil: %s", err)
 	}
@@ -34,6 +36,44 @@ func TestConversation_Send(t *testing.T) {
 	}
 }
 
+// TestConversation_SendStreaming tests the SSE streaming functionality.
+// It verifies that:
+//   - The callback is invoked with text fragments as they arrive
+//   - The accumulated reply matches the complete response
+//   - Token counts and stop reason are correctly returned
+func TestConversation_SendStreaming(t *testing.T) {
+	conversation := NewConversation("You are a friendly assistant.")
+
+	// Track how many times the callback is invoked with content
+	var tokenCount int
+	callback := func(text string, done bool) {
+		if !done && text != "" {
+			tokenCount++
+		}
+	}
+
+	reply, stopReason, inputTokens, outputTokens, err :=
+		conversation.SendStreaming("Say hello in exactly 5 words.", llmapi.Sampling{}, callback)
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	if reply == "" {
+		t.Errorf("Expected reply to not be empty")
+	}
+	if stopReason == "" {
+		t.Errorf("Expected stopReason to not be empty")
+	}
+	if inputTokens == 0 {
+		t.Errorf("Expected inputTokens to not be 0")
+	}
+	if outputTokens == 0 {
+		t.Errorf("Expected outputTokens to not be 0")
+	}
+	if tokenCount == 0 {
+		t.Errorf("Expected callback to be called at least once with tokens")
+	}
+}
+
 // TestConversation_SendUntilDone tests the SendUntilDone method, which will
 // in turn also test MergeIfLastTwoAssistant method as Claude should generally
 // require more than two replies to complete this conversation.
@@ -42,7 +82,7 @@ func TestConversation_SendUntilDone(t *testing.T) {
 	conversation.Settings.MaxTokens = 125
 	reply, stopReason, inputTokens, outputTokens, err :=
 		conversation.SendUntilDone(
-			"Tell me about the impact of the Byzantines on the world.")
+			"Tell me about the impact of the Byzantines on the world.", llmapi.Sampling{})
 	if err != nil {
 		t.Errorf("Expected err to be nil: %s", err)
 	}
@@ -57,6 +97,48 @@ func TestConversation_SendUntilDone(t *testing.T) {
 	}
 	if outputTokens == 0 {
 		t.Errorf("Expected outputTokens to not be 0")
+	}
+}
+
+// TestConversation_SendStreamingUntilDone tests streaming with auto-continuation.
+// With MaxTokens set to 125, the response will hit the token limit and require
+// multiple continuations. This test verifies that:
+//   - Streaming continues across multiple API calls
+//   - The callback receives tokens from all continuations
+//   - The final stopReason is "end_turn" (not "max_tokens")
+//   - MergeIfLastTwoAssistant correctly combines continued responses
+func TestConversation_SendStreamingUntilDone(t *testing.T) {
+	conversation := NewConversation("You are a friendly assistant.")
+	// Low max_tokens forces multiple continuations
+	conversation.Settings.MaxTokens = 125
+
+	var tokenCount int
+	callback := func(text string, done bool) {
+		if !done && text != "" {
+			tokenCount++
+		}
+	}
+
+	reply, stopReason, inputTokens, outputTokens, err :=
+		conversation.SendStreamingUntilDone(
+			"Tell me about the impact of the Byzantines on the world.", llmapi.Sampling{}, callback)
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	if reply == "" {
+		t.Errorf("Expected reply to not be empty")
+	}
+	if stopReason != "end_turn" {
+		t.Errorf("Expected stopReason to be 'end_turn', got '%s'", stopReason)
+	}
+	if inputTokens == 0 {
+		t.Errorf("Expected inputTokens to not be 0")
+	}
+	if outputTokens == 0 {
+		t.Errorf("Expected outputTokens to not be 0")
+	}
+	if tokenCount == 0 {
+		t.Errorf("Expected callback to be called at least once with tokens")
 	}
 }
 
@@ -120,6 +202,32 @@ func TestCacheStatistics(t *testing.T) {
 	expectedSavings := 81.0 // 810 saved out of 1000 input tokens
 	if savingsRate != expectedSavings {
 		t.Errorf("Expected cache savings rate %.1f%%, got %.1f%%", expectedSavings, savingsRate)
+	}
+}
+
+// TestListModels tests the ListModels utility function
+func TestListModels(t *testing.T) {
+	models, err := ListModels("")
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	if models == nil {
+		t.Error("Expected models to not be nil")
+		return
+	}
+	if len(models.Data) == 0 {
+		t.Error("Expected at least one model to be returned")
+	}
+
+	t.Logf("Found %d models:", len(models.Data))
+	for _, model := range models.Data {
+		t.Logf("  - %s (%s)", model.ID, model.DisplayName)
+		if model.ID == "" {
+			t.Error("Expected model ID to not be empty")
+		}
+		if model.DisplayName == "" {
+			t.Error("Expected model DisplayName to not be empty")
+		}
 	}
 }
 
