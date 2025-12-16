@@ -1007,18 +1007,6 @@ func (conversation *Conversation) MergeIfLastTwoAssistant() {
 	*conversation.Messages = (*conversation.Messages)[:lastIdx]
 }
 
-//func (conversation *Conversation) SendUntilDone(
-//	text string,
-//) (
-//	output string,
-//	stopReason string,
-//	inputTokens int,
-//	outputTokens int,
-//	err error,
-//) {
-//
-//}
-
 // init loads the API token from token files or environment variable.
 // Priority: ./.anthropic_key > ~/.anthropic_key > ANTHROPIC_API_KEY env var
 func init() {
