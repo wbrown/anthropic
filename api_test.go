@@ -1,7 +1,10 @@
 package anthropic
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/wbrown/llmapi"
 )
 
 func TestInit(t *testing.T) {
@@ -16,7 +19,7 @@ func TestConversation_Send(t *testing.T) {
 	// Test that the reply is not empty
 	conversation := NewConversation("You are a friendly assistant.")
 	reply, stopReason, inputTokens, outputTokens, err :=
-		conversation.Send("Hello Claude!")
+		conversation.Send("Hello Claude!", llmapi.Sampling{})
 	if err != nil {
 		t.Errorf("Expected err to be nil: %s", err)
 	}
@@ -34,6 +37,44 @@ func TestConversation_Send(t *testing.T) {
 	}
 }
 
+// TestConversation_SendStreaming tests the SSE streaming functionality.
+// It verifies that:
+//   - The callback is invoked with text fragments as they arrive
+//   - The accumulated reply matches the complete response
+//   - Token counts and stop reason are correctly returned
+func TestConversation_SendStreaming(t *testing.T) {
+	conversation := NewConversation("You are a friendly assistant.")
+
+	// Track how many times the callback is invoked with content
+	var tokenCount int
+	callback := func(text string, done bool) {
+		if !done && text != "" {
+			tokenCount++
+		}
+	}
+
+	reply, stopReason, inputTokens, outputTokens, err :=
+		conversation.SendStreaming("Say hello in exactly 5 words.", llmapi.Sampling{}, callback)
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	if reply == "" {
+		t.Errorf("Expected reply to not be empty")
+	}
+	if stopReason == "" {
+		t.Errorf("Expected stopReason to not be empty")
+	}
+	if inputTokens == 0 {
+		t.Errorf("Expected inputTokens to not be 0")
+	}
+	if outputTokens == 0 {
+		t.Errorf("Expected outputTokens to not be 0")
+	}
+	if tokenCount == 0 {
+		t.Errorf("Expected callback to be called at least once with tokens")
+	}
+}
+
 // TestConversation_SendUntilDone tests the SendUntilDone method, which will
 // in turn also test MergeIfLastTwoAssistant method as Claude should generally
 // require more than two replies to complete this conversation.
@@ -42,7 +83,7 @@ func TestConversation_SendUntilDone(t *testing.T) {
 	conversation.Settings.MaxTokens = 125
 	reply, stopReason, inputTokens, outputTokens, err :=
 		conversation.SendUntilDone(
-			"Tell me about the impact of the Byzantines on the world.")
+			"Tell me about the impact of the Byzantines on the world.", llmapi.Sampling{})
 	if err != nil {
 		t.Errorf("Expected err to be nil: %s", err)
 	}
@@ -57,6 +98,48 @@ func TestConversation_SendUntilDone(t *testing.T) {
 	}
 	if outputTokens == 0 {
 		t.Errorf("Expected outputTokens to not be 0")
+	}
+}
+
+// TestConversation_SendStreamingUntilDone tests streaming with auto-continuation.
+// With MaxTokens set to 125, the response will hit the token limit and require
+// multiple continuations. This test verifies that:
+//   - Streaming continues across multiple API calls
+//   - The callback receives tokens from all continuations
+//   - The final stopReason is "end_turn" (not "max_tokens")
+//   - MergeIfLastTwoAssistant correctly combines continued responses
+func TestConversation_SendStreamingUntilDone(t *testing.T) {
+	conversation := NewConversation("You are a friendly assistant.")
+	// Low max_tokens forces multiple continuations
+	conversation.Settings.MaxTokens = 125
+
+	var tokenCount int
+	callback := func(text string, done bool) {
+		if !done && text != "" {
+			tokenCount++
+		}
+	}
+
+	reply, stopReason, inputTokens, outputTokens, err :=
+		conversation.SendStreamingUntilDone(
+			"Tell me about the impact of the Byzantines on the world.", llmapi.Sampling{}, callback)
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	if reply == "" {
+		t.Errorf("Expected reply to not be empty")
+	}
+	if stopReason != "end_turn" {
+		t.Errorf("Expected stopReason to be 'end_turn', got '%s'", stopReason)
+	}
+	if inputTokens == 0 {
+		t.Errorf("Expected inputTokens to not be 0")
+	}
+	if outputTokens == 0 {
+		t.Errorf("Expected outputTokens to not be 0")
+	}
+	if tokenCount == 0 {
+		t.Errorf("Expected callback to be called at least once with tokens")
 	}
 }
 
@@ -123,7 +206,474 @@ func TestCacheStatistics(t *testing.T) {
 	}
 }
 
+// TestListModels tests the ListModels utility function
+func TestListModels(t *testing.T) {
+	models, err := ListModels("")
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	if models == nil {
+		t.Error("Expected models to not be nil")
+		return
+	}
+	if len(models.Data) == 0 {
+		t.Error("Expected at least one model to be returned")
+	}
+
+	t.Logf("Found %d models:", len(models.Data))
+	for _, model := range models.Data {
+		t.Logf("  - %s (%s)", model.ID, model.DisplayName)
+		if model.ID == "" {
+			t.Error("Expected model ID to not be empty")
+		}
+		if model.DisplayName == "" {
+			t.Error("Expected model DisplayName to not be empty")
+		}
+	}
+}
+
 // Helper function to create string pointers
 func stringPtr(s string) *string {
 	return &s
+}
+
+// TestSendRich tests the SendRich method with text content blocks.
+// Verifies that:
+//   - Rich content can be sent and receives a response
+//   - Response contains proper content blocks
+//   - Token counts and stop reason are returned
+func TestSendRich(t *testing.T) {
+	conversation := NewConversation("You are a friendly assistant.")
+
+	content := []llmapi.ContentBlock{
+		llmapi.NewTextBlock("Hello Claude! Say hi back in 5 words or less."),
+	}
+
+	response, err := conversation.SendRich(content, llmapi.Sampling{})
+	if err != nil {
+		t.Fatalf("Expected err to be nil: %s", err)
+	}
+	if response == nil {
+		t.Fatal("Expected response to not be nil")
+	}
+	if len(response.Content) == 0 {
+		t.Error("Expected response to have content blocks")
+	}
+	if response.Text() == "" {
+		t.Error("Expected response text to not be empty")
+	}
+	if response.StopReason == "" {
+		t.Error("Expected stopReason to not be empty")
+	}
+	if response.InputTokens == 0 {
+		t.Error("Expected inputTokens to not be 0")
+	}
+	if response.OutputTokens == 0 {
+		t.Error("Expected outputTokens to not be 0")
+	}
+
+	// Verify the message was added to history
+	messages := conversation.GetRichMessages()
+	if len(messages) < 2 {
+		t.Errorf("Expected at least 2 messages in history, got %d", len(messages))
+	}
+}
+
+// TestAddRichMessage_GetRichMessages tests adding and retrieving rich messages.
+func TestAddRichMessage_GetRichMessages(t *testing.T) {
+	conversation := NewConversation("You are helpful.")
+
+	// Add a user message with multiple content blocks
+	userContent := []llmapi.ContentBlock{
+		llmapi.NewTextBlock("First part."),
+		llmapi.NewTextBlock("Second part."),
+	}
+	conversation.AddRichMessage("user", userContent)
+
+	// Add an assistant message
+	assistantContent := []llmapi.ContentBlock{
+		llmapi.NewTextBlock("Here is my response."),
+	}
+	conversation.AddRichMessage("assistant", assistantContent)
+
+	// Retrieve and verify
+	messages := conversation.GetRichMessages()
+	if len(messages) != 2 {
+		t.Fatalf("Expected 2 messages, got %d", len(messages))
+	}
+
+	// Verify user message
+	if messages[0].Role != "user" {
+		t.Errorf("Expected first message role to be 'user', got '%s'", messages[0].Role)
+	}
+	if len(messages[0].Content) != 2 {
+		t.Errorf("Expected user message to have 2 content blocks, got %d", len(messages[0].Content))
+	}
+
+	// Verify assistant message
+	if messages[1].Role != "assistant" {
+		t.Errorf("Expected second message role to be 'assistant', got '%s'", messages[1].Role)
+	}
+	if len(messages[1].Content) != 1 {
+		t.Errorf("Expected assistant message to have 1 content block, got %d", len(messages[1].Content))
+	}
+}
+
+// TestSetTools_GetTools tests tool configuration.
+func TestSetTools_GetTools(t *testing.T) {
+	conversation := NewConversation("You are helpful.")
+
+	// Initially no tools
+	tools := conversation.GetTools()
+	if len(tools) != 0 {
+		t.Errorf("Expected no tools initially, got %d", len(tools))
+	}
+
+	// Set some tools
+	newTools := []llmapi.ToolDefinition{
+		{
+			Name:        "get_weather",
+			Description: "Get the current weather for a location",
+			InputSchema: []byte(`{"type": "object", "properties": {"location": {"type": "string"}}}`),
+		},
+		{
+			Name:        "get_time",
+			Description: "Get the current time",
+			InputSchema: []byte(`{"type": "object", "properties": {}}`),
+		},
+	}
+	conversation.SetTools(newTools)
+
+	// Verify tools were set
+	tools = conversation.GetTools()
+	if len(tools) != 2 {
+		t.Fatalf("Expected 2 tools, got %d", len(tools))
+	}
+	if tools[0].Name != "get_weather" {
+		t.Errorf("Expected first tool name to be 'get_weather', got '%s'", tools[0].Name)
+	}
+	if tools[1].Name != "get_time" {
+		t.Errorf("Expected second tool name to be 'get_time', got '%s'", tools[1].Name)
+	}
+
+	// Clear tools
+	conversation.SetTools(nil)
+	tools = conversation.GetTools()
+	if len(tools) != 0 {
+		t.Errorf("Expected no tools after clearing, got %d", len(tools))
+	}
+}
+
+// TestGetCapabilities tests the capability reporting.
+func TestGetCapabilities(t *testing.T) {
+	conversation := NewConversation("You are helpful.")
+
+	caps := conversation.GetCapabilities()
+
+	// Anthropic should support all features
+	if !caps.SupportsImages {
+		t.Error("Expected SupportsImages to be true")
+	}
+	if !caps.SupportsDocuments {
+		t.Error("Expected SupportsDocuments to be true")
+	}
+	if !caps.SupportsToolUse {
+		t.Error("Expected SupportsToolUse to be true")
+	}
+	if !caps.SupportsThinking {
+		t.Error("Expected SupportsThinking to be true")
+	}
+	if !caps.SupportsStreaming {
+		t.Error("Expected SupportsStreaming to be true")
+	}
+}
+
+// TestContentBlockConversion tests the conversion between llmapi and anthropic content blocks.
+func TestContentBlockConversion(t *testing.T) {
+	// Test text block conversion
+	t.Run("TextBlock", func(t *testing.T) {
+		llmapiBlock := llmapi.NewTextBlock("Hello world")
+		anthropicBlocks := toAnthropicContentBlocks([]llmapi.ContentBlock{llmapiBlock})
+
+		if len(anthropicBlocks) != 1 {
+			t.Fatalf("Expected 1 block, got %d", len(anthropicBlocks))
+		}
+		if anthropicBlocks[0].ContentType != "text" {
+			t.Errorf("Expected type 'text', got '%s'", anthropicBlocks[0].ContentType)
+		}
+		if anthropicBlocks[0].Text == nil || *anthropicBlocks[0].Text != "Hello world" {
+			t.Error("Expected text to be 'Hello world'")
+		}
+
+		// Convert back
+		llmapiBlocks := fromAnthropicContentBlocks(anthropicBlocks)
+		if len(llmapiBlocks) != 1 {
+			t.Fatalf("Expected 1 block back, got %d", len(llmapiBlocks))
+		}
+		if llmapiBlocks[0].Type != llmapi.ContentTypeText {
+			t.Errorf("Expected type text, got %s", llmapiBlocks[0].Type)
+		}
+		if llmapiBlocks[0].Text != "Hello world" {
+			t.Errorf("Expected text 'Hello world', got '%s'", llmapiBlocks[0].Text)
+		}
+	})
+
+	// Test tool result block conversion
+	t.Run("ToolResultBlock", func(t *testing.T) {
+		llmapiBlock := llmapi.NewToolResultBlock("tool_123", "Result data", false)
+		anthropicBlocks := toAnthropicContentBlocks([]llmapi.ContentBlock{llmapiBlock})
+
+		if len(anthropicBlocks) != 1 {
+			t.Fatalf("Expected 1 block, got %d", len(anthropicBlocks))
+		}
+		if anthropicBlocks[0].ContentType != "tool_result" {
+			t.Errorf("Expected type 'tool_result', got '%s'", anthropicBlocks[0].ContentType)
+		}
+		if anthropicBlocks[0].ToolUseID == nil || *anthropicBlocks[0].ToolUseID != "tool_123" {
+			t.Error("Expected tool_use_id to be 'tool_123'")
+		}
+	})
+
+	// Test thinking block conversion (from anthropic to llmapi)
+	t.Run("ThinkingBlock", func(t *testing.T) {
+		thinking := "Let me think about this..."
+		anthropicBlocks := []ContentBlock{
+			{
+				ContentType: "thinking",
+				Thinking:    &thinking,
+			},
+		}
+
+		llmapiBlocks := fromAnthropicContentBlocks(anthropicBlocks)
+		if len(llmapiBlocks) != 1 {
+			t.Fatalf("Expected 1 block, got %d", len(llmapiBlocks))
+		}
+		if llmapiBlocks[0].Type != llmapi.ContentTypeThinking {
+			t.Errorf("Expected type thinking, got %s", llmapiBlocks[0].Type)
+		}
+		if llmapiBlocks[0].Thinking == nil {
+			t.Fatal("Expected Thinking to not be nil")
+		}
+		if llmapiBlocks[0].Thinking.Thinking != thinking {
+			t.Errorf("Expected thinking text '%s', got '%s'", thinking, llmapiBlocks[0].Thinking.Thinking)
+		}
+	})
+}
+
+// TestRichResponseHelpers tests the helper methods on RichResponse.
+func TestRichResponseHelpers(t *testing.T) {
+	response := llmapi.RichResponse{
+		Content: []llmapi.ContentBlock{
+			{Type: llmapi.ContentTypeThinking, Thinking: &llmapi.ThinkingContent{Thinking: "My reasoning"}},
+			{Type: llmapi.ContentTypeText, Text: "Hello "},
+			{Type: llmapi.ContentTypeText, Text: "world!"},
+			{Type: llmapi.ContentTypeToolUse, ToolUse: &llmapi.ToolUseContent{ID: "tool_1", Name: "test_tool"}},
+		},
+		StopReason:   "end_turn",
+		InputTokens:  100,
+		OutputTokens: 50,
+	}
+
+	// Test Text()
+	text := response.Text()
+	if text != "Hello world!" {
+		t.Errorf("Expected text 'Hello world!', got '%s'", text)
+	}
+
+	// Test ThinkingText()
+	thinking := response.ThinkingText()
+	if thinking != "My reasoning" {
+		t.Errorf("Expected thinking 'My reasoning', got '%s'", thinking)
+	}
+
+	// Test ToolUses()
+	toolUses := response.ToolUses()
+	if len(toolUses) != 1 {
+		t.Fatalf("Expected 1 tool use, got %d", len(toolUses))
+	}
+	if toolUses[0].Name != "test_tool" {
+		t.Errorf("Expected tool name 'test_tool', got '%s'", toolUses[0].Name)
+	}
+
+	// Test HasToolUse()
+	if !response.HasToolUse() {
+		t.Error("Expected HasToolUse() to return true")
+	}
+
+	// Test with no tool use
+	noToolResponse := llmapi.RichResponse{
+		Content: []llmapi.ContentBlock{
+			{Type: llmapi.ContentTypeText, Text: "Just text"},
+		},
+	}
+	if noToolResponse.HasToolUse() {
+		t.Error("Expected HasToolUse() to return false for text-only response")
+	}
+}
+
+// TestParseSSEStreamRich_TextOnly tests parsing SSE stream with text content only.
+func TestParseSSEStreamRich_TextOnly(t *testing.T) {
+	// Mock SSE stream with text deltas
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":25}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world!"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+
+	conv := NewConversation("Test")
+	var callbackText string
+	var callbackDone bool
+	callback := func(text string, done bool) {
+		callbackText += text
+		callbackDone = done
+	}
+
+	reader := strings.NewReader(sseData)
+	fullText, stopReason, inputTokens, outputTokens, err := conv.parseSSEStreamRich(reader, callback)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if fullText != "Hello world!" {
+		t.Errorf("Expected fullText 'Hello world!', got '%s'", fullText)
+	}
+	if stopReason != "end_turn" {
+		t.Errorf("Expected stopReason 'end_turn', got '%s'", stopReason)
+	}
+	if inputTokens != 25 {
+		t.Errorf("Expected inputTokens 25, got %d", inputTokens)
+	}
+	if outputTokens != 10 {
+		t.Errorf("Expected outputTokens 10, got %d", outputTokens)
+	}
+	if callbackText != "Hello world!" {
+		t.Errorf("Expected callback to receive 'Hello world!', got '%s'", callbackText)
+	}
+	if !callbackDone {
+		t.Error("Expected callback to be called with done=true")
+	}
+}
+
+// TestParseSSEStreamRich_WithThinking tests parsing SSE stream with thinking blocks.
+func TestParseSSEStreamRich_WithThinking(t *testing.T) {
+	// Mock SSE stream with thinking and text
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":50}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think..."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" Done thinking."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"The answer is 42."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":30}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+
+	conv := NewConversation("Test")
+	reader := strings.NewReader(sseData)
+	fullText, stopReason, inputTokens, outputTokens, err := conv.parseSSEStreamRich(reader, nil)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Log the actual output for verification
+	t.Logf("Full text output:\n%s", fullText)
+
+	// Should contain thinking tags
+	expectedThinking := "<thinking>\nLet me think... Done thinking.\n</thinking>\n"
+	if !strings.Contains(fullText, expectedThinking) {
+		t.Errorf("Expected fullText to contain thinking block, got '%s'", fullText)
+	}
+
+	// Should contain text
+	if !strings.Contains(fullText, "The answer is 42.") {
+		t.Errorf("Expected fullText to contain 'The answer is 42.', got '%s'", fullText)
+	}
+
+	if stopReason != "end_turn" {
+		t.Errorf("Expected stopReason 'end_turn', got '%s'", stopReason)
+	}
+	if inputTokens != 50 {
+		t.Errorf("Expected inputTokens 50, got %d", inputTokens)
+	}
+	if outputTokens != 30 {
+		t.Errorf("Expected outputTokens 30, got %d", outputTokens)
+	}
+
+	// Should set HasThinkingContent flag
+	if !conv.HasThinkingContent {
+		t.Error("Expected HasThinkingContent to be true")
+	}
+}
+
+// TestParseSSEStreamRich_MaxTokens tests parsing SSE stream that stops due to max_tokens.
+func TestParseSSEStreamRich_MaxTokens(t *testing.T) {
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":100}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial response..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":50}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+
+	conv := NewConversation("Test")
+	reader := strings.NewReader(sseData)
+	fullText, stopReason, _, _, err := conv.parseSSEStreamRich(reader, nil)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if fullText != "Partial response..." {
+		t.Errorf("Expected 'Partial response...', got '%s'", fullText)
+	}
+	if stopReason != "max_tokens" {
+		t.Errorf("Expected stopReason 'max_tokens', got '%s'", stopReason)
+	}
 }

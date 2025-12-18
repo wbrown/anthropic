@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+
+	"github.com/wbrown/llmapi"
 )
 
 // REPL is a Read-Eval-Print Loop for a conversation. It reads input from
@@ -19,7 +21,7 @@ func (conversation *Conversation) REPL() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		text := scanner.Text()
-		conversation.Send(text)
+		conversation.Send(text, llmapi.Sampling{})
 		// Get the assistant's last response
 		messages := *conversation.Messages
 		assistantResponse := *(messages[len(*conversation.Messages)-1])
