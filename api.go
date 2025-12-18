@@ -95,8 +95,8 @@ type SystemPrompt struct {
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
-// Messages is a sequence of messages in a conversation. It usually always
-// a user message first, and alternates between user and assistant messages.
+// Messages is a sequence of messages in a conversation. It usually starts with
+// a user message, and alternates between user and assistant messages.
 type Messages struct {
 	Model       string           `json:"model"`
 	MaxTokens   int              `json:"max_tokens"`
@@ -387,7 +387,6 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		req.Header.Set("anthropic-beta", c.Settings.Beta)
 	}
 
-	// req.Header.Set("anthropic-beta", "max-tokens-3-5-sonnet-2024-07-15")
 	// Perform API request via HTTP POST
 	httpComplete := false
 	var resp *http.Response
@@ -409,9 +408,8 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	}
 
 	defer func(Body io.ReadCloser) {
-		closeErr := Body.Close()
-		if closeErr != nil {
-			panic(closeErr)
+		if closeErr := Body.Close(); closeErr != nil {
+			log.Printf("error closing response body: %v", closeErr)
 		}
 	}(resp.Body)
 
@@ -422,7 +420,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 
 	// Check response status first
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, bodyBytes)
 	}
 
 	// Deserialize response
@@ -578,7 +576,11 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		}
 		if attempt < retries {
 			time.Sleep(retryDelay)
-			req, _ = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			req, err = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			if err != nil {
+				// Request creation failed, continue to next retry attempt
+				continue
+			}
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-api-key", c.ApiToken)
 			req.Header.Set("anthropic-version", c.Settings.Version)
@@ -643,7 +645,7 @@ func (c *Conversation) GetRichMessages() []llmapi.RichMessage {
 	result := make([]llmapi.RichMessage, len(*c.Messages))
 	for i, msg := range *c.Messages {
 		result[i] = llmapi.RichMessage{
-			Role:    msg.Role,
+			Role:    llmapi.Role(msg.Role),
 			Content: fromAnthropicContentBlocks(*msg.Content),
 		}
 	}
@@ -765,7 +767,7 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 //
 // Parameters:
 //   - text: The user message to send. If empty, continues from the last message.
-//   - sampling: Sampling parameters (currently unused, reserved for future use).
+//   - sampling: Sampling parameters to override conversation defaults (Temperature, TopP, TopK).
 //   - callback: Called with each text fragment; called with ("", true) when done.
 //
 // Returns the same values as Send, but tokens are streamed via callback as they arrive.
@@ -873,7 +875,11 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		}
 		if attempt < retries {
 			time.Sleep(retryDelay)
-			req, _ = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			req, err = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			if err != nil {
+				// Request creation failed, continue to next retry attempt
+				continue
+			}
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-api-key", conversation.ApiToken)
 			req.Header.Set("anthropic-version", conversation.Settings.Version)
@@ -1040,7 +1046,7 @@ func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback ll
 }
 
 func (conversation *Conversation) SendUntilDone(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens int, err error) {
-	var output = ""
+	output := ""
 	done := false
 	input := text
 	for !done {
@@ -1114,7 +1120,7 @@ func (conversation *Conversation) SendStreamingUntilDone(text string, sampling l
 }
 
 // AddMessage adds a message to the conversation with the given role and
-// content. It used internally, and also can be used externally to
+// content. It is used internally, and can also be used externally to
 // manipulate conversations.
 func (conversation *Conversation) AddMessage(role, content string) {
 
@@ -1155,7 +1161,7 @@ func (conversation *Conversation) GetMessages() []llmapi.Message {
 			}
 		}
 		result = append(result, llmapi.Message{
-			Role:    msg.Role,
+			Role:    llmapi.Role(msg.Role),
 			Content: content,
 		})
 	}
@@ -1201,14 +1207,6 @@ func (conversation *Conversation) SetModel(model string) {
 // API URIs
 var messagesURI = "https://api.anthropic.com/v1/messages"
 var modelsURI = "https://api.anthropic.com/v1/models"
-
-// API default headers (currently unused - headers are set inline in Send/SendStreaming)
-// var headers = map[string]string{
-// 	"Content-Type":      "application/json",
-// 	"x-api-key":         "",
-// 	"anthropic_version": "2023-06-01",
-// 	// "anthropic-beta":    "max-tokens-3-5-sonnet-2024-07-15",
-// }
 
 var retries = 3
 var retryDelay = 3 * time.Second
@@ -1486,7 +1484,7 @@ func toAnthropicContentBlock(block llmapi.ContentBlock) ContentBlock {
 		if block.Image != nil {
 			cb.Source = &ContentSource{
 				Encoding:  block.Image.Source.Type,
-				MediaType: block.Image.Source.MediaType,
+				MediaType: string(block.Image.Source.MediaType),
 				Data:      block.Image.Source.Data,
 			}
 		}
@@ -1535,7 +1533,7 @@ func fromAnthropicContentBlock(block ContentBlock) llmapi.ContentBlock {
 			cb.Image = &llmapi.ImageContent{
 				Source: llmapi.ImageSource{
 					Type:      block.Source.Encoding,
-					MediaType: block.Source.MediaType,
+					MediaType: llmapi.MediaType(block.Source.MediaType),
 					Data:      block.Source.Data,
 				},
 			}
