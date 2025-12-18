@@ -18,6 +18,13 @@ import (
 // Compile-time interface check
 var _ llmapi.Conversation = (*Conversation)(nil)
 
+// API URIs
+var messagesURI = "https://api.anthropic.com/v1/messages"
+var modelsURI = "https://api.anthropic.com/v1/models"
+
+var retries = 3
+var retryDelay = 3 * time.Second
+
 // ToolDefinition represents a tool that can be used by Claude
 type ToolDefinition struct {
 	Name         string          `json:"name"`
@@ -1120,7 +1127,7 @@ func (conversation *Conversation) SendStreamingUntilDone(text string, sampling l
 }
 
 // AddMessage adds a message to the conversation with the given role and
-// content. It is used internally, and can also be used externally to
+// content. It is used internally and can also be used externally to
 // manipulate conversations.
 func (conversation *Conversation) AddMessage(role, content string) {
 
@@ -1203,13 +1210,6 @@ func (conversation *Conversation) SetModel(model string) {
 	}
 	conversation.Settings.Model = model
 }
-
-// API URIs
-var messagesURI = "https://api.anthropic.com/v1/messages"
-var modelsURI = "https://api.anthropic.com/v1/models"
-
-var retries = 3
-var retryDelay = 3 * time.Second
 
 // MergeIfLastTwoAssistant merges the last two assistant messages if they are
 // both from the assistant. This is useful for combining messages that are
