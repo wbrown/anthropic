@@ -185,9 +185,11 @@ type StreamEvent struct {
 // For content_block_delta events, Text contains the new text fragment.
 // For message_delta events, StopReason contains the final stop reason.
 type StreamDelta struct {
-	Type       string  `json:"type,omitempty"`
-	Text       string  `json:"text,omitempty"`
-	StopReason *string `json:"stop_reason,omitempty"`
+	Type        string  `json:"type,omitempty"`
+	Text        string  `json:"text,omitempty"`
+	Thinking    string  `json:"thinking,omitempty"`
+	PartialJSON string  `json:"partial_json,omitempty"`
+	StopReason  *string `json:"stop_reason,omitempty"`
 }
 
 // StreamUsage contains token usage information from streaming responses.
@@ -260,29 +262,41 @@ type Conversation struct {
 	HasThinkingContent bool
 }
 
-// Send sends a message to the assistant and returns the reply. It also
-// returns the reason the conversation stopped, the number of input tokens
-// used, and the number of output tokens used.
-//
-// If the text is empty, it sends the message as is, and does not add a user
-// message to the conversation. This is useful for continuing an incomplete
-// conversation by "assistant", in the case of a stopReason of "max_tokens".
-func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens int, err error) {
-	if conversation.Settings == nil {
-		return "", "", 0, 0,
-			fmt.Errorf("conversation settings not set")
+// NewConversation creates a new conversation with the given system prompt. It
+// initializes the messages and usage statistics, as well as reasonable
+// defaults.
+func NewConversation(system string) *Conversation {
+	messages := make([]*Message, 0)
+	conversation := Conversation{
+		System:   &system,
+		Messages: &messages,
 	}
-	if conversation.ApiToken == "" {
-		return "", "", 0, 0,
-			fmt.Errorf("API token not set")
+	conversation.Usage.OutputTokens = 0
+	conversation.Usage.InputTokens = 0
+	// Copy our default settings
+	settings := DefaultSettings
+	conversation.Settings = &settings
+	conversation.ApiToken = DefaultApiToken
+
+	// Initialize the HTTP client
+	conversation.HttpClient = &http.Client{}
+	return &conversation
+}
+
+func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Response, error) {
+	if c.Settings == nil {
+		return nil, fmt.Errorf("conversation settings not set")
+	}
+	if c.ApiToken == "" {
+		return nil, fmt.Errorf("API token not set")
 	}
 	if text != "" {
-		conversation.AddMessage("user", text)
-	} else if len(*conversation.Messages) > 2 &&
-		(*conversation.Messages)[len(*conversation.Messages)-1].Role !=
+		c.AddMessage("user", text)
+	} else if len(*c.Messages) > 2 &&
+		(*c.Messages)[len(*c.Messages)-1].Role !=
 			"assistant" {
 		// Check if the last user message contains tool results
-		lastMsg := (*conversation.Messages)[len(*conversation.Messages)-1]
+		lastMsg := (*c.Messages)[len(*c.Messages)-1]
 		if lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0 {
 			// Check if this is a tool result message
 			hasToolResult := false
@@ -295,68 +309,65 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 			if !hasToolResult {
 				// If the text is empty, and the last message is not from the
 				// assistant, we can't continue the conversation, so return
-				return "", "", 0, 0,
-					fmt.Errorf("cannot continue conversation")
+				return nil, fmt.Errorf("cannot continue conversation")
 			}
 			// If it's a tool result, allow continuation
 		} else {
-			return "", "", 0, 0,
-				fmt.Errorf("cannot continue conversation")
+			return nil, fmt.Errorf("cannot continue conversation")
 		}
 	}
 
 	// Build system prompt with cache control if needed
 	var system interface{}
-	if conversation.System != nil && *conversation.System != "" {
-		if conversation.SystemCacheable {
+	if c.System != nil && *c.System != "" {
+		if c.SystemCacheable {
 			// Use array format with cache control
 			system = []SystemPrompt{{
 				Type:         "text",
-				Text:         *conversation.System,
+				Text:         *c.System,
 				CacheControl: &CacheControl{Type: "ephemeral", TTL: "1h"},
 			}}
 		} else {
 			// Use simple string format
-			system = conversation.System
+			system = c.System
 		}
 	}
 
 	// Build tools with cache control if needed
-	tools := conversation.Tools
+	tools := c.Tools
 	// Note: The API doesn't support caching individual tools, only the entire tools array
 	// Tool caching is handled at the API level, not per-tool
 
 	// Use sampling overrides if provided (non-zero), otherwise use conversation defaults
-	temperature := conversation.Settings.Temperature
+	temperature := c.Settings.Temperature
 	if sampling.Temperature != 0 {
 		temperature = sampling.Temperature
 	}
-	topP := conversation.Settings.TopP
+	topP := c.Settings.TopP
 	if sampling.TopP != 0 {
 		topP = sampling.TopP
 	}
-	topK := conversation.Settings.TopK
+	topK := c.Settings.TopK
 	if sampling.TopK != 0 {
 		topK = sampling.TopK
 	}
 
 	messages := Messages{
-		Model:       conversation.Settings.Model,
-		MaxTokens:   conversation.Settings.MaxTokens,
+		Model:       c.Settings.Model,
+		MaxTokens:   c.Settings.MaxTokens,
 		Temperature: temperature,
 		TopP:        topP,
 		TopK:        topK,
 		System:      system,
-		Messages:    conversation.Messages,
+		Messages:    c.Messages,
 		Tools:       tools,
-		Thinking:    conversation.Settings.Thinking,
+		Thinking:    c.Settings.Thinking,
 	}
 
 	// Marshal messages to JSON
 	jsonData, marshalErr := json.Marshal(messages)
 	if marshalErr != nil {
-		return "", "", 0, 0,
-			fmt.Errorf("error marshalling to JSON: %s", marshalErr)
+		return nil, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
 	}
 
 	// Debug: Log request if ANTHROPIC_DEBUG is set
@@ -367,14 +378,13 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 	req, err := http.NewRequest("POST", messagesURI,
 		bytes.NewBuffer(jsonData))
 	if err != nil {
-		return "", "", 0, 0,
-			fmt.Errorf("error creating HTTP request: %s", err)
+		return nil, fmt.Errorf("error creating HTTP request: %s", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", conversation.ApiToken)
-	req.Header.Set("anthropic-version", conversation.Settings.Version)
-	if conversation.Settings.Beta != "" {
-		req.Header.Set("anthropic-beta", conversation.Settings.Beta)
+	req.Header.Set("x-api-key", c.ApiToken)
+	req.Header.Set("anthropic-version", c.Settings.Version)
+	if c.Settings.Beta != "" {
+		req.Header.Set("anthropic-beta", c.Settings.Beta)
 	}
 
 	// req.Header.Set("anthropic-beta", "max-tokens-3-5-sonnet-2024-07-15")
@@ -384,11 +394,10 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 	errCt := 0
 	for !httpComplete {
 		var httpErr error
-		resp, httpErr = conversation.HttpClient.Do(req)
+		resp, httpErr = c.HttpClient.Do(req)
 		errCt++
 		if httpErr != nil && errCt > retries {
-			return "", "", 0, 0,
-				fmt.Errorf("http error: %s", httpErr)
+			return nil, fmt.Errorf("http error: %s", httpErr)
 		} else if httpErr == nil {
 			httpComplete = true
 		} else {
@@ -396,8 +405,7 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 		}
 	}
 	if resp == nil {
-		return "", "", 0, 0,
-			fmt.Errorf("HTTP response is nil")
+		return nil, fmt.Errorf("HTTP response is nil")
 	}
 
 	defer func(Body io.ReadCloser) {
@@ -409,14 +417,12 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 
 	bodyBytes, bodyErr := io.ReadAll(resp.Body)
 	if bodyErr != nil {
-		return "", "", 0, 0,
-			fmt.Errorf("error reading response body: %s", bodyErr)
+		return nil, fmt.Errorf("error reading response body: %s", bodyErr)
 	}
 
 	// Check response status first
 	if resp.StatusCode != http.StatusOK {
-		return "", "", 0, 0,
-			fmt.Errorf("API returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
 	// Deserialize response
@@ -426,38 +432,291 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 		bodyStr := string(bodyBytes)
 		if strings.HasPrefix(strings.TrimSpace(bodyStr), "<") {
 			// Likely an HTML error page
-			return "", "", 0, 0,
-				fmt.Errorf("received HTML error page from API (status %d)", resp.StatusCode)
+			return nil, fmt.Errorf("received HTML error page from API (status %d)", resp.StatusCode)
 		}
-		return "", "", 0, 0,
-			fmt.Errorf("error unmarshaling JSON response: %s", jsonErr)
+		return nil, fmt.Errorf("error unmarshaling JSON response: %s", jsonErr)
 	}
 	if response.MessageType == "error" {
-		return string(bodyBytes), "", 0, 0,
-			fmt.Errorf("API error: %s", bodyBytes)
+		return nil, fmt.Errorf("API error: %s", bodyBytes)
 	}
 
-	reply = ""
-	// Set tokens on all content blocks before adding
+	// Set tokens on all content blocks
 	for i := range *response.Content {
 		(*response.Content)[i].tokens = response.Usage.OutputTokens
 	}
 
-	var responseText string
+	return &response, nil
+}
 
+// SendRich sends a message with rich content blocks.
+func (c *Conversation) SendRich(content []llmapi.ContentBlock, sampling llmapi.Sampling) (*llmapi.RichResponse, error) {
+	// Add the content as a user message if provided
+	if len(content) > 0 {
+		c.AddRichMessage("user", content)
+	}
+
+	// Call internal send directly to get full response
+	response, err := c.sendInternal("", sampling)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add assistant message with full content blocks to history
+	c.addResponseAsMessage(response)
+
+	// Update usage statistics
+	c.Usage.InputTokens += response.Usage.InputTokens
+	c.Usage.OutputTokens += response.Usage.OutputTokens
+
+	// Update cache statistics
+	if response.Usage.CacheCreationInputTokens > 0 {
+		c.CacheStats.TotalCacheCreationTokens += response.Usage.CacheCreationInputTokens
+		c.CacheStats.CacheMisses++
+	}
+	if response.Usage.CacheReadInputTokens > 0 {
+		c.CacheStats.TotalCacheReadTokens += response.Usage.CacheReadInputTokens
+		c.CacheStats.CacheHits++
+		regularCost := response.Usage.CacheReadInputTokens
+		cacheCost := regularCost / 10
+		c.CacheStats.TotalTokensSaved += (regularCost - cacheCost)
+	}
+
+	// Convert response content blocks to llmapi format
+	llmapiContent := fromAnthropicContentBlocks(*response.Content)
+
+	return &llmapi.RichResponse{
+		Content:      llmapiContent,
+		StopReason:   response.StopReason,
+		InputTokens:  response.Usage.InputTokens,
+		OutputTokens: response.Usage.OutputTokens,
+	}, nil
+}
+
+// SendRichStreaming sends rich content with streaming.
+func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling llmapi.Sampling, callback llmapi.StreamCallback) (*llmapi.RichResponse, error) {
+	if c.Settings == nil {
+		return nil, fmt.Errorf("conversation settings not set")
+	}
+	if c.ApiToken == "" {
+		return nil, fmt.Errorf("API token not set")
+	}
+
+	if len(content) > 0 {
+		c.AddRichMessage("user", content)
+	}
+
+	// Build system prompt with cache control if needed
+	var system interface{}
+	if c.System != nil && *c.System != "" {
+		if c.SystemCacheable {
+			system = []SystemPrompt{{
+				Type:         "text",
+				Text:         *c.System,
+				CacheControl: &CacheControl{Type: "ephemeral", TTL: "1h"},
+			}}
+		} else {
+			system = c.System
+		}
+	}
+
+	// Use sampling overrides if provided
+	temperature := c.Settings.Temperature
+	if sampling.Temperature != 0 {
+		temperature = sampling.Temperature
+	}
+	topP := c.Settings.TopP
+	if sampling.TopP != 0 {
+		topP = sampling.TopP
+	}
+	topK := c.Settings.TopK
+	if sampling.TopK != 0 {
+		topK = sampling.TopK
+	}
+
+	messages := Messages{
+		Model:       c.Settings.Model,
+		MaxTokens:   c.Settings.MaxTokens,
+		Temperature: temperature,
+		TopP:        topP,
+		TopK:        topK,
+		System:      system,
+		Messages:    c.Messages,
+		Tools:       c.Tools,
+		Thinking:    c.Settings.Thinking,
+		Stream:      true,
+	}
+
+	jsonData, marshalErr := json.Marshal(messages)
+	if marshalErr != nil {
+		return nil, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
+	}
+
+	req, err := http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("error creating HTTP request: %s", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", c.ApiToken)
+	req.Header.Set("anthropic-version", c.Settings.Version)
+	req.Header.Set("Accept", "text/event-stream")
+	if c.Settings.Beta != "" {
+		req.Header.Set("anthropic-beta", c.Settings.Beta)
+	}
+
+	// Use a client without timeout for streaming
+	client := &http.Client{Timeout: 0}
+	if c.HttpClient != nil && c.HttpClient.Transport != nil {
+		client.Transport = c.HttpClient.Transport
+	}
+
+	// Perform request with retries
+	var resp *http.Response
+	for attempt := 0; attempt <= retries; attempt++ {
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt < retries {
+			time.Sleep(retryDelay)
+			req, _ = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-api-key", c.ApiToken)
+			req.Header.Set("anthropic-version", c.Settings.Version)
+			req.Header.Set("Accept", "text/event-stream")
+			if c.Settings.Beta != "" {
+				req.Header.Set("anthropic-beta", c.Settings.Beta)
+			}
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("HTTP error after %d retries: %s", retries, err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("HTTP response is nil")
+	}
+	defer func(Body io.ReadCloser) {
+		if closeErr := Body.Close(); closeErr != nil {
+			log.Printf("error closing response body: %v", closeErr)
+		}
+	}(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, body)
+	}
+
+	// Parse SSE stream
+	reply, stopReason, inputTokens, outputTokens, err := c.parseSSEStreamRich(resp.Body, callback)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add assistant message to history
+	c.AddMessage("assistant", reply)
+
+	// Update usage statistics
+	c.Usage.InputTokens += inputTokens
+	c.Usage.OutputTokens += outputTokens
+
+	return &llmapi.RichResponse{
+		Content: []llmapi.ContentBlock{
+			llmapi.NewTextBlock(reply),
+		},
+		StopReason:   stopReason,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+	}, nil
+}
+
+// AddRichMessage adds a message with multiple content blocks.
+func (c *Conversation) AddRichMessage(role string, content []llmapi.ContentBlock) {
+	blocks := toAnthropicContentBlocks(content)
+	msg := Message{
+		Role:    role,
+		Content: &blocks,
+	}
+	*c.Messages = append(*c.Messages, &msg)
+}
+
+// GetRichMessages returns the full conversation with content blocks.
+func (c *Conversation) GetRichMessages() []llmapi.RichMessage {
+	result := make([]llmapi.RichMessage, len(*c.Messages))
+	for i, msg := range *c.Messages {
+		result[i] = llmapi.RichMessage{
+			Role:    msg.Role,
+			Content: fromAnthropicContentBlocks(*msg.Content),
+		}
+	}
+	return result
+}
+
+// SetTools sets the tools for the conversation.
+func (c *Conversation) SetTools(tools []llmapi.ToolDefinition) {
+	c.Tools = make([]ToolDefinition, len(tools))
+	for i, t := range tools {
+		c.Tools[i] = ToolDefinition{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.InputSchema,
+		}
+	}
+}
+
+// GetTools returns currently configured tools.
+func (c *Conversation) GetTools() []llmapi.ToolDefinition {
+	result := make([]llmapi.ToolDefinition, len(c.Tools))
+	for i, t := range c.Tools {
+		result[i] = llmapi.ToolDefinition{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.InputSchema,
+		}
+	}
+	return result
+}
+
+// GetCapabilities returns Anthropic's supported features.
+func (c *Conversation) GetCapabilities() llmapi.Capabilities {
+	// @todo: Probably a way to get this programmatically.
+	return llmapi.Capabilities{
+		SupportsImages:      true,
+		SupportsDocuments:   true,
+		SupportsToolUse:     true,
+		SupportsThinking:    true,
+		SupportsStreaming:   true,
+		MaxImageSize:        20 * 1024 * 1024, // 20MB for now? Idk
+		SupportedImageTypes: []string{"image/jpeg", "image/png", "image/gif", "image/webp"},
+	}
+}
+
+// Send sends a message to the assistant and returns the reply. It also
+// returns the reason the conversation stopped, the number of input tokens
+// used, and the number of output tokens used.
+//
+// If the text is empty, it sends the message as is, and does not add a user
+// message to the conversation. This is useful for continuing an incomplete
+// conversation by "assistant", in the case of a stopReason of "max_tokens".
+func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens int, err error) {
+	// Call internal send (it handles adding user message)
+	response, err := conversation.sendInternal(text, sampling)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+
+	// Extract text for adding to history
+	var responseText string
 	for i := range *response.Content {
 		if (*response.Content)[i].ContentType == "text" {
 			responseText = *(*response.Content)[i].Text
 		}
 	}
 
-	// Add ALL response content as a single message
+	// Add assistant response to history
 	conversation.AddMessage("assistant", responseText)
 
 	// Build reply from text and thinking content blocks
 	var hasThinking bool
 	for _, contentBlock := range *response.Content {
-		// Debug: Log all content block types
 		if os.Getenv("ANTHROPIC_DEBUG") == "true" {
 			fmt.Printf("DEBUG: Content block type: %s\n", contentBlock.ContentType)
 		}
@@ -465,7 +724,6 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 		if contentBlock.ContentType == "text" && contentBlock.Text != nil {
 			reply += *contentBlock.Text
 		} else if contentBlock.ContentType == "thinking" && contentBlock.Thinking != nil {
-			// Include thinking in the reply with tags
 			reply += "<thinking>\n" + *contentBlock.Thinking + "\n</thinking>\n"
 			hasThinking = true
 		}
@@ -479,18 +737,6 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 		}
 	}
 
-	// It is difficult to distinguish the usage of the system prompt vs
-	// the user message, so we will just use the input tokens from the
-	// response.
-	inputTokens = response.Usage.InputTokens
-	outputTokens = response.Usage.OutputTokens
-	// Scan for last user message, and update the input tokens
-	for i := len(*conversation.Messages) - 1; i >= 0; i-- {
-		if (*conversation.Messages)[i].Role == "user" {
-			(*(*conversation.Messages)[i].Content)[0].tokens = inputTokens
-			break
-		}
-	}
 	// Add usage statistics to conversation
 	conversation.Usage.InputTokens += response.Usage.InputTokens
 	conversation.Usage.OutputTokens += response.Usage.OutputTokens
@@ -511,11 +757,7 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 		conversation.CacheStats.TotalTokensSaved += (regularCost - cacheCost)
 	}
 
-	return reply,
-		response.StopReason,
-		inputTokens,
-		outputTokens,
-		nil
+	return reply, response.StopReason, response.Usage.InputTokens, response.Usage.OutputTokens, nil
 }
 
 // SendStreaming sends a message with real-time token streaming via SSE.
@@ -660,7 +902,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 	}
 
 	// Parse SSE stream
-	reply, stopReason, inputTokens, outputTokens, err = conversation.parseSSEStream(resp.Body, callback)
+	reply, stopReason, inputTokens, outputTokens, err = conversation.parseSSEStreamRich(resp.Body, callback)
 	if err != nil {
 		return reply, stopReason, inputTokens, outputTokens, err
 	}
@@ -675,7 +917,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 	return reply, stopReason, inputTokens, outputTokens, nil
 }
 
-// parseSSEStream reads Server-Sent Events from the response body and processes them.
+// parseSSEStreamRich reads Server-Sent Events from the response body and processes them.
 // It extracts text deltas, token counts, and stop reason from the stream.
 //
 // SSE format from Anthropic:
@@ -691,7 +933,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 //
 //	event: message_stop
 //	data: {"type":"message_stop"}
-func (conversation *Conversation) parseSSEStream(body io.Reader, callback llmapi.StreamCallback) (
+func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback llmapi.StreamCallback) (
 	fullText string,
 	stopReason string,
 	inputTokens int,
@@ -699,7 +941,9 @@ func (conversation *Conversation) parseSSEStream(body io.Reader, callback llmapi
 	err error,
 ) {
 	scanner := bufio.NewScanner(body)
-	var accumulated strings.Builder
+	var currentBlockType string
+	var textBuilder strings.Builder
+	var thinkingBuilder strings.Builder
 	var currentEvent string
 
 	for scanner.Scan() {
@@ -731,14 +975,32 @@ func (conversation *Conversation) parseSSEStream(body io.Reader, callback llmapi
 				inputTokens = event.Message.Usage.InputTokens
 			}
 
+		case "content_block_start":
+			// Track what type of block we're starting
+			if event.Content != nil {
+				currentBlockType = event.Content.ContentType
+			}
+
 		case "content_block_delta":
-			// Text fragments arrive here - invoke callback for real-time display
-			if event.Delta != nil && event.Delta.Text != "" {
-				accumulated.WriteString(event.Delta.Text)
-				if callback != nil {
-					callback(event.Delta.Text, false)
+			if event.Delta != nil {
+				switch event.Delta.Type {
+				case "text_delta":
+					textBuilder.WriteString(event.Delta.Text)
+					if callback != nil {
+						callback(event.Delta.Text, false)
+					}
+				case "thinking_delta":
+					thinkingBuilder.WriteString(event.Delta.Thinking)
+					// Optionally stream thinking to callback too
+					if callback != nil && event.Delta.Thinking != "" {
+						callback(event.Delta.Thinking, false)
+					}
 				}
 			}
+
+		case "content_block_stop":
+			// Block finished - could finalize here if needed
+			currentBlockType = ""
 
 		case "message_delta":
 			// Final event before message_stop - contains stop reason and output tokens
@@ -758,10 +1020,23 @@ func (conversation *Conversation) parseSSEStream(body io.Reader, callback llmapi
 	}
 
 	if err := scanner.Err(); err != nil {
-		return accumulated.String(), stopReason, inputTokens, outputTokens, fmt.Errorf("error reading stream: %w", err)
+		return textBuilder.String(), stopReason, inputTokens, outputTokens, fmt.Errorf("error reading stream: %w", err)
 	}
 
-	return accumulated.String(), stopReason, inputTokens, outputTokens, nil
+	// Build full text with thinking if present
+	var result strings.Builder
+	if thinkingBuilder.Len() > 0 {
+		result.WriteString("<thinking>\n")
+		result.WriteString(thinkingBuilder.String())
+		result.WriteString("\n</thinking>\n")
+		conversation.HasThinkingContent = true
+	}
+	result.WriteString(textBuilder.String())
+
+	// Suppress unused variable warning
+	_ = currentBlockType
+
+	return result.String(), stopReason, inputTokens, outputTokens, nil
 }
 
 func (conversation *Conversation) SendUntilDone(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens int, err error) {
@@ -855,7 +1130,6 @@ func (conversation *Conversation) AddMessage(role, content string) {
 
 		*conversation.Messages = append(*conversation.Messages, &message)
 	}
-
 }
 
 // GetMessages returns the conversation history as llmapi.Message slices.
@@ -922,27 +1196,6 @@ func (conversation *Conversation) SetModel(model string) {
 		conversation.Settings = &settings
 	}
 	conversation.Settings.Model = model
-}
-
-// NewConversation creates a new conversation with the given system prompt. It
-// initializes the messages and usage statistics, as well as reasonable
-// defaults.
-func NewConversation(system string) *Conversation {
-	messages := make([]*Message, 0)
-	conversation := Conversation{
-		System:   &system,
-		Messages: &messages,
-	}
-	conversation.Usage.OutputTokens = 0
-	conversation.Usage.InputTokens = 0
-	// Copy our default settings
-	settings := DefaultSettings
-	conversation.Settings = &settings
-	conversation.ApiToken = DefaultApiToken
-
-	// Initialize the HTTP client
-	conversation.HttpClient = &http.Client{}
-	return &conversation
 }
 
 // API URIs
@@ -1218,4 +1471,143 @@ func (c *Conversation) CacheLastNMessages(n int) {
 			}
 		}
 	}
+}
+
+// @todo: Move this into a utilities file.
+
+// toAnthropicContentBlock converts a llmapi ContentBlock to anthropic format.
+func toAnthropicContentBlock(block llmapi.ContentBlock) ContentBlock {
+	cb := ContentBlock{ContentType: string(block.Type)}
+
+	switch block.Type {
+	case llmapi.ContentTypeText:
+		cb.Text = &block.Text
+	case llmapi.ContentTypeImage:
+		if block.Image != nil {
+			cb.Source = &ContentSource{
+				Encoding:  block.Image.Source.Type,
+				MediaType: block.Image.Source.MediaType,
+				Data:      block.Image.Source.Data,
+			}
+		}
+	case llmapi.ContentTypeToolUse:
+		if block.ToolUse != nil {
+			cb.ID = &block.ToolUse.ID
+			cb.Name = &block.ToolUse.Name
+			cb.Input = &block.ToolUse.Input
+		}
+	case llmapi.ContentTypeToolResult:
+		if block.ToolResult != nil {
+			cb.ToolUseID = &block.ToolResult.ToolUseID
+			cb.Content = &block.ToolResult.Content
+		}
+	case llmapi.ContentTypeThinking:
+		if block.Thinking != nil {
+			cb.Thinking = &block.Thinking.Thinking
+			if block.Thinking.Signature != "" {
+				cb.Signature = &block.Thinking.Signature
+			}
+		}
+	}
+	return cb
+}
+
+// toAnthropicContentBlocks converts an array of llmapi ContentBlocks to anthropic format.
+func toAnthropicContentBlocks(blocks []llmapi.ContentBlock) []ContentBlock {
+	result := make([]ContentBlock, len(blocks))
+	for i, block := range blocks {
+		result[i] = toAnthropicContentBlock(block)
+	}
+	return result
+}
+
+// fromAnthropicContentBlock converts an anthropic ContentBlock to llmapi format.
+func fromAnthropicContentBlock(block ContentBlock) llmapi.ContentBlock {
+	cb := llmapi.ContentBlock{Type: llmapi.ContentType(block.ContentType)}
+
+	switch block.ContentType {
+	case "text":
+		if block.Text != nil {
+			cb.Text = *block.Text
+		}
+	case "image":
+		if block.Source != nil {
+			cb.Image = &llmapi.ImageContent{
+				Source: llmapi.ImageSource{
+					Type:      block.Source.Encoding,
+					MediaType: block.Source.MediaType,
+					Data:      block.Source.Data,
+				},
+			}
+		}
+
+	case "tool_use":
+		cb.ToolUse = &llmapi.ToolUseContent{
+			ID:    derefString(block.ID),
+			Name:  derefString(block.Name),
+			Input: derefRawMessage(block.Input),
+		}
+
+	case "tool_result":
+		cb.ToolResult = &llmapi.ToolResultContent{
+			ToolUseID: derefString(block.ToolUseID),
+			Content:   derefString(block.Content),
+		}
+	case "thinking":
+		if block.Thinking != nil {
+			cb.Thinking = &llmapi.ThinkingContent{
+				Thinking:  *block.Thinking,
+				Signature: derefString(block.Signature),
+			}
+		}
+	}
+	return cb
+}
+
+// fromAnthropicContentBlocks converts an array of anthropic content blocks into llmapi ones.
+func fromAnthropicContentBlocks(blocks []ContentBlock) []llmapi.ContentBlock {
+	result := make([]llmapi.ContentBlock, len(blocks))
+	for i, block := range blocks {
+		result[i] = fromAnthropicContentBlock(block)
+	}
+	return result
+}
+
+// Helper functions
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func derefRawMessage(r *json.RawMessage) json.RawMessage {
+	if r == nil {
+		return nil
+	}
+	return *r
+}
+
+// addResponseAsMessage - Add response content blocks as assistant messages
+func (c *Conversation) addResponseAsMessage(response *Response) {
+	// Store ALL content blocks, not just text
+	msg := Message{
+		Role:    "assistant",
+		Content: response.Content, // keep tool_use, thinking, etc.
+	}
+	*c.Messages = append(*c.Messages, &msg)
+}
+
+// flattenResponseToString - flattens response to string for backwards compatability.
+func (c *Conversation) flattenResponseToString(response *Response) string {
+	var reply string
+	for _, block := range *response.Content {
+		if block.ContentType == "text" && block.Text != nil {
+			reply += derefString(block.Text)
+		} else if block.ContentType == "thinking" && block.Thinking != nil {
+			reply += "<thinking>\n" + derefString(block.Thinking) + "\n</thinking>\n"
+		}
+	}
+	return reply
 }
