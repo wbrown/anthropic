@@ -298,7 +298,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		return nil, fmt.Errorf("API token not set")
 	}
 	if text != "" {
-		c.AddMessage("user", text)
+		c.AddMessage(llmapi.RoleUser, text)
 	} else if len(*c.Messages) > 2 &&
 		(*c.Messages)[len(*c.Messages)-1].Role !=
 			"assistant" {
@@ -457,7 +457,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 func (c *Conversation) SendRich(content []llmapi.ContentBlock, sampling llmapi.Sampling) (*llmapi.RichResponse, error) {
 	// Add the content as a user message if provided
 	if len(content) > 0 {
-		c.AddRichMessage("user", content)
+		c.AddRichMessage(llmapi.RoleUser, content)
 	}
 
 	// Call internal send directly to get full response
@@ -507,7 +507,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 	}
 
 	if len(content) > 0 {
-		c.AddRichMessage("user", content)
+		c.AddRichMessage(llmapi.RoleUser, content)
 	}
 
 	// Build system prompt with cache control if needed
@@ -621,7 +621,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 	}
 
 	// Add assistant message to history
-	c.AddMessage("assistant", reply)
+	c.AddMessage(llmapi.RoleAssistant, reply)
 
 	// Update usage statistics
 	c.Usage.InputTokens += inputTokens
@@ -638,10 +638,10 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 }
 
 // AddRichMessage adds a message with multiple content blocks.
-func (c *Conversation) AddRichMessage(role string, content []llmapi.ContentBlock) {
+func (c *Conversation) AddRichMessage(role llmapi.Role, content []llmapi.ContentBlock) {
 	blocks := toAnthropicContentBlocks(content)
 	msg := Message{
-		Role:    role,
+		Role:    string(role),
 		Content: &blocks,
 	}
 	*c.Messages = append(*c.Messages, &msg)
@@ -721,7 +721,7 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 	}
 
 	// Add assistant response to history
-	conversation.AddMessage("assistant", responseText)
+	conversation.AddMessage(llmapi.RoleAssistant, responseText)
 
 	// Build reply from text and thinking content blocks
 	var hasThinking bool
@@ -788,7 +788,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 
 	// Add user message if provided
 	if text != "" {
-		conversation.AddMessage("user", text)
+		conversation.AddMessage(llmapi.RoleUser, text)
 	} else if len(*conversation.Messages) > 0 &&
 		(*conversation.Messages)[len(*conversation.Messages)-1].Role != "assistant" {
 		// Check if the last user message contains tool results
@@ -921,7 +921,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 	}
 
 	// Add assistant message to history
-	conversation.AddMessage("assistant", reply)
+	conversation.AddMessage(llmapi.RoleAssistant, reply)
 
 	// Update usage statistics
 	conversation.Usage.InputTokens += inputTokens
@@ -1129,7 +1129,7 @@ func (conversation *Conversation) SendStreamingUntilDone(text string, sampling l
 // AddMessage adds a message to the conversation with the given role and
 // content. It is used internally and can also be used externally to
 // manipulate conversations.
-func (conversation *Conversation) AddMessage(role, content string) {
+func (conversation *Conversation) AddMessage(role llmapi.Role, content string) {
 
 	if content != "" {
 		contentBlock := ContentBlock{
@@ -1137,7 +1137,7 @@ func (conversation *Conversation) AddMessage(role, content string) {
 			Text:        &content,
 		}
 		message := Message{
-			Role:    role,
+			Role:    string(role),
 			Content: &[]ContentBlock{contentBlock},
 		}
 

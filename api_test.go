@@ -288,13 +288,13 @@ func TestAddRichMessage_GetRichMessages(t *testing.T) {
 		llmapi.NewTextBlock("First part."),
 		llmapi.NewTextBlock("Second part."),
 	}
-	conversation.AddRichMessage("user", userContent)
+	conversation.AddRichMessage(llmapi.RoleUser, userContent)
 
 	// Add an assistant message
 	assistantContent := []llmapi.ContentBlock{
 		llmapi.NewTextBlock("Here is my response."),
 	}
-	conversation.AddRichMessage("assistant", assistantContent)
+	conversation.AddRichMessage(llmapi.RoleAssistant, assistantContent)
 
 	// Retrieve and verify
 	messages := conversation.GetRichMessages()
