@@ -3,6 +3,7 @@ package anthropic
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -235,6 +236,9 @@ type ThinkingConfig struct {
 
 // A Conversation is a sequence of messages between a user and an assistant.
 type Conversation struct {
+	// Ctx is the context for cancellation and timeouts.
+	// If nil, context.Background() is used.
+	Ctx context.Context
 	// System is the system prompt to use for the conversation.
 	System *string
 	// SystemCacheable indicates if the system prompt should be cached
@@ -267,6 +271,14 @@ type Conversation struct {
 	ToolsCacheable bool
 	// HasThinkingContent tracks if any responses included thinking blocks
 	HasThinkingContent bool
+}
+
+// context returns the conversation's context, defaulting to Background if nil.
+func (c *Conversation) context() context.Context {
+	if c.Ctx != nil {
+		return c.Ctx
+	}
+	return context.Background()
 }
 
 // NewConversation creates a new conversation with the given system prompt. It
@@ -382,7 +394,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		fmt.Printf("DEBUG: Request thinking config: %+v\n", messages.Thinking)
 	}
 
-	req, err := http.NewRequest("POST", messagesURI,
+	req, err := http.NewRequestWithContext(c.context(), "POST", messagesURI,
 		bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP request: %s", err)
@@ -556,7 +568,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		return nil, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
 	}
 
-	req, err := http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(c.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP request: %s", err)
 	}
@@ -583,7 +595,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		}
 		if attempt < retries {
 			time.Sleep(retryDelay)
-			req, err = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			req, err = http.NewRequestWithContext(c.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
 			if err != nil {
 				// Request creation failed, continue to next retry attempt
 				continue
@@ -855,7 +867,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		return "", "", 0, 0, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
 	}
 
-	req, err := http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(conversation.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("error creating HTTP request: %s", err)
 	}
@@ -882,7 +894,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		}
 		if attempt < retries {
 			time.Sleep(retryDelay)
-			req, err = http.NewRequest("POST", messagesURI, bytes.NewBuffer(jsonData))
+			req, err = http.NewRequestWithContext(conversation.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
 			if err != nil {
 				// Request creation failed, continue to next retry attempt
 				continue
@@ -1201,6 +1213,13 @@ func (conversation *Conversation) Clear() {
 	conversation.Usage.OutputTokens = 0
 }
 
+// SetContext sets the context for cancellation and timeouts.
+// The context applies to all subsequent API calls until changed.
+// Pass nil to clear the context (will use context.Background()).
+func (conversation *Conversation) SetContext(ctx context.Context) {
+	conversation.Ctx = ctx
+}
+
 // SetModel changes the model for subsequent API calls.
 // If settings haven't been initialized, they are created from DefaultSettings.
 func (conversation *Conversation) SetModel(model string) {
@@ -1393,8 +1412,12 @@ type ModelsResponse struct {
 	HasMore bool    `json:"has_more"`
 }
 
-// ListModels retrieves the list of available models
-func ListModels(apiKey string) (*ModelsResponse, error) {
+// ListModels retrieves the list of available models.
+// If ctx is nil, context.Background() is used.
+func ListModels(ctx context.Context, apiKey string) (*ModelsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if apiKey == "" {
 		apiKey = DefaultApiToken
 	}
@@ -1402,7 +1425,7 @@ func ListModels(apiKey string) (*ModelsResponse, error) {
 		return nil, fmt.Errorf("API key not provided")
 	}
 
-	req, err := http.NewRequest("GET", modelsURI, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", modelsURI, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
