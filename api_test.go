@@ -1,8 +1,12 @@
 package anthropic
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wbrown/llmapi"
 )
@@ -208,7 +212,7 @@ func TestCacheStatistics(t *testing.T) {
 
 // TestListModels tests the ListModels utility function
 func TestListModels(t *testing.T) {
-	models, err := ListModels("")
+	models, err := ListModels(nil, "")
 	if err != nil {
 		t.Errorf("Expected err to be nil: %s", err)
 	}
@@ -676,4 +680,210 @@ data: {"type":"message_stop"}
 	if stopReason != "max_tokens" {
 		t.Errorf("Expected stopReason 'max_tokens', got '%s'", stopReason)
 	}
+}
+
+// TestContextCancellation tests that requests respect context cancellation.
+// It creates a mock server that delays response, then cancels the context
+// before the response arrives.
+func TestContextCancellation(t *testing.T) {
+	// Create a server that delays its response
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Delay longer than our context timeout
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn"}`))
+	}))
+	defer server.Close()
+
+	// Save original URI and restore after test
+	originalURI := messagesURI
+	messagesURI = server.URL
+	defer func() { messagesURI = originalURI }()
+
+	// Create a context that will be cancelled quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	conv := NewConversation("Test system prompt")
+	conv.SetContext(ctx)
+	conv.ApiToken = "test-token"
+
+	_, _, _, _, err := conv.Send("Hello", llmapi.Sampling{})
+
+	// Should get a context deadline exceeded error
+	if err == nil {
+		t.Fatal("Expected error due to context cancellation, got nil")
+	}
+
+	// Check that the error is related to context cancellation
+	if !strings.Contains(err.Error(), "context deadline exceeded") &&
+		!strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("Expected context cancellation error, got: %v", err)
+	}
+}
+
+// TestContextCancellationImmediate tests immediate context cancellation.
+func TestContextCancellationImmediate(t *testing.T) {
+	// Create a server (won't actually be reached)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Save original URI and restore after test
+	originalURI := messagesURI
+	messagesURI = server.URL
+	defer func() { messagesURI = originalURI }()
+
+	// Create an already-cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	conv := NewConversation("Test system prompt")
+	conv.SetContext(ctx)
+	conv.ApiToken = "test-token"
+
+	_, _, _, _, err := conv.Send("Hello", llmapi.Sampling{})
+
+	// Should get a context cancelled error
+	if err == nil {
+		t.Fatal("Expected error due to context cancellation, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("Expected context canceled error, got: %v", err)
+	}
+}
+
+// TestContextCancellationStreaming tests that streaming requests respect context cancellation.
+func TestContextCancellationStreaming(t *testing.T) {
+	// Create a server that delays its response
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Save original URI and restore after test
+	originalURI := messagesURI
+	messagesURI = server.URL
+	defer func() { messagesURI = originalURI }()
+
+	// Create a context that will be cancelled quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	conv := NewConversation("Test system prompt")
+	conv.SetContext(ctx)
+	conv.ApiToken = "test-token"
+
+	_, _, _, _, err := conv.SendStreaming("Hello", llmapi.Sampling{}, nil)
+
+	if err == nil {
+		t.Fatal("Expected error due to context cancellation, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "context deadline exceeded") &&
+		!strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("Expected context cancellation error, got: %v", err)
+	}
+}
+
+// =============================================================================
+// Real-world context cancellation tests (no mock server)
+// =============================================================================
+
+// TestContextCancellationPreCancelled tests that an already-cancelled context
+// results in a context cancellation error.
+func TestContextCancellationPreCancelled(t *testing.T) {
+	// Create an already-cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	conv := NewConversation("Test")
+	conv.SetContext(ctx)
+	conv.ApiToken = "test-token" // Doesn't need to be valid
+
+	_, _, _, _, err := conv.Send("Hello", llmapi.Sampling{})
+
+	if err == nil {
+		t.Fatal("Expected error due to pre-cancelled context")
+	}
+
+	// The error should indicate context cancellation
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("Expected context canceled error, got: %v", err)
+	}
+}
+
+// TestContextCancellationTinyTimeout tests cancellation with a very short timeout
+// against the real API endpoint. This tests the actual HTTP client behavior.
+func TestContextCancellationTinyTimeout(t *testing.T) {
+	// 1ms timeout - will fail during TCP/TLS handshake
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	conv := NewConversation("Test")
+	conv.SetContext(ctx)
+	conv.ApiToken = "test-token" // Doesn't need to be valid
+
+	_, _, _, _, err := conv.Send("Hello", llmapi.Sampling{})
+
+	if err == nil {
+		t.Fatal("Expected error due to timeout")
+	}
+
+	// The error should indicate context deadline exceeded
+	if !strings.Contains(err.Error(), "context deadline exceeded") &&
+		!strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("Expected context error, got: %v", err)
+	}
+}
+
+// TestContextCancellationMidStream tests cancelling a real streaming request
+// mid-generation. This is an integration test that requires valid API credentials.
+func TestContextCancellationMidStream(t *testing.T) {
+	if DefaultApiToken == "" {
+		t.Skip("Skipping integration test: ANTHROPIC_API_KEY not set")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	conv := NewConversation("You are a helpful assistant.")
+	conv.SetContext(ctx)
+
+	var tokensReceived int
+	var cancelled bool
+
+	// Cancel after receiving some tokens
+	callback := func(text string, done bool) {
+		if done {
+			return
+		}
+		tokensReceived++
+		// Cancel after receiving a few tokens
+		if tokensReceived >= 5 && !cancelled {
+			cancelled = true
+			cancel()
+		}
+	}
+
+	// Ask for a long response
+	_, _, _, _, err := conv.SendStreaming(
+		"Write a detailed 500 word essay about the history of computing.",
+		llmapi.Sampling{},
+		callback,
+	)
+
+	// Should get an error due to cancellation
+	if err == nil {
+		t.Log("Request completed without error (generation finished before cancellation)")
+		return
+	}
+
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("Expected context canceled error, got: %v", err)
+	}
+
+	t.Logf("Successfully cancelled after receiving %d tokens", tokensReceived)
 }
