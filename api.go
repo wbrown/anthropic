@@ -20,7 +20,7 @@ import (
 var _ llmapi.Conversation = (*Conversation)(nil)
 
 // API URIs
-var messagesURI = "https://api.anthropic.com/v1/messages"
+var DefaultMessagesURI = "https://api.anthropic.com/v1/messages"
 var modelsURI = "https://api.anthropic.com/v1/models"
 
 var retries = 3
@@ -263,6 +263,9 @@ type Conversation struct {
 	HttpClient *http.Client
 	// apiToken is the API token used for API requests
 	ApiToken string `json:"-"`
+	// Endpoint overrides the default API endpoint URL.
+	// If empty, DefaultMessagesURI is used.
+	Endpoint string
 	// Settings is the settings for the conversation.
 	Settings *SampleSettings
 	// Tools are optional tool definitions for the conversation
@@ -279,6 +282,21 @@ func (c *Conversation) context() context.Context {
 		return c.Ctx
 	}
 	return context.Background()
+}
+
+// SetEndpoint overrides the API endpoint URL for this conversation.
+// Pass empty string to revert to DefaultMessagesURI.
+func (c *Conversation) SetEndpoint(endpoint string) {
+	c.Endpoint = endpoint
+}
+
+// endpoint returns the effective API endpoint URL.
+// Returns Endpoint if set, otherwise DefaultMessagesURI.
+func (c *Conversation) endpoint() string {
+	if c.Endpoint != "" {
+		return c.Endpoint
+	}
+	return DefaultMessagesURI
 }
 
 // NewConversation creates a new conversation with the given system prompt. It
@@ -394,7 +412,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		fmt.Printf("DEBUG: Request thinking config: %+v\n", messages.Thinking)
 	}
 
-	req, err := http.NewRequestWithContext(c.context(), "POST", messagesURI,
+	req, err := http.NewRequestWithContext(c.context(), "POST", c.endpoint(),
 		bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP request: %s", err)
@@ -568,7 +586,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		return nil, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
 	}
 
-	req, err := http.NewRequestWithContext(c.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(c.context(), "POST", c.endpoint(), bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP request: %s", err)
 	}
@@ -595,7 +613,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		}
 		if attempt < retries {
 			time.Sleep(retryDelay)
-			req, err = http.NewRequestWithContext(c.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
+			req, err = http.NewRequestWithContext(c.context(), "POST", c.endpoint(), bytes.NewBuffer(jsonData))
 			if err != nil {
 				// Request creation failed, continue to next retry attempt
 				continue
@@ -867,7 +885,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		return "", "", 0, 0, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
 	}
 
-	req, err := http.NewRequestWithContext(conversation.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(conversation.context(), "POST", conversation.endpoint(), bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("error creating HTTP request: %s", err)
 	}
@@ -894,7 +912,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		}
 		if attempt < retries {
 			time.Sleep(retryDelay)
-			req, err = http.NewRequestWithContext(conversation.context(), "POST", messagesURI, bytes.NewBuffer(jsonData))
+			req, err = http.NewRequestWithContext(conversation.context(), "POST", conversation.endpoint(), bytes.NewBuffer(jsonData))
 			if err != nil {
 				// Request creation failed, continue to next retry attempt
 				continue
