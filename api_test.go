@@ -696,9 +696,9 @@ func TestContextCancellation(t *testing.T) {
 	defer server.Close()
 
 	// Save original URI and restore after test
-	originalURI := messagesURI
-	messagesURI = server.URL
-	defer func() { messagesURI = originalURI }()
+	originalURI := DefaultMessagesURI
+	DefaultMessagesURI = server.URL
+	defer func() { DefaultMessagesURI = originalURI }()
 
 	// Create a context that will be cancelled quickly
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -731,9 +731,9 @@ func TestContextCancellationImmediate(t *testing.T) {
 	defer server.Close()
 
 	// Save original URI and restore after test
-	originalURI := messagesURI
-	messagesURI = server.URL
-	defer func() { messagesURI = originalURI }()
+	originalURI := DefaultMessagesURI
+	DefaultMessagesURI = server.URL
+	defer func() { DefaultMessagesURI = originalURI }()
 
 	// Create an already-cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -765,9 +765,9 @@ func TestContextCancellationStreaming(t *testing.T) {
 	defer server.Close()
 
 	// Save original URI and restore after test
-	originalURI := messagesURI
-	messagesURI = server.URL
-	defer func() { messagesURI = originalURI }()
+	originalURI := DefaultMessagesURI
+	DefaultMessagesURI = server.URL
+	defer func() { DefaultMessagesURI = originalURI }()
 
 	// Create a context that will be cancelled quickly
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -837,6 +837,64 @@ func TestContextCancellationTinyTimeout(t *testing.T) {
 	if !strings.Contains(err.Error(), "context deadline exceeded") &&
 		!strings.Contains(err.Error(), "context canceled") {
 		t.Errorf("Expected context error, got: %v", err)
+	}
+}
+
+// TestEndpointOverride tests the endpoint override functionality.
+func TestEndpointOverride(t *testing.T) {
+	conv := NewConversation("System")
+
+	// Default should use DefaultMessagesURI
+	if conv.endpoint() != DefaultMessagesURI {
+		t.Errorf("Expected default endpoint %q, got %q", DefaultMessagesURI, conv.endpoint())
+	}
+
+	// Set custom endpoint
+	customEndpoint := "https://custom.api.example.com/v1/messages"
+	conv.SetEndpoint(customEndpoint)
+
+	if conv.Endpoint != customEndpoint {
+		t.Errorf("Expected Endpoint field to be %q, got %q", customEndpoint, conv.Endpoint)
+	}
+
+	if conv.endpoint() != customEndpoint {
+		t.Errorf("Expected endpoint() to return %q, got %q", customEndpoint, conv.endpoint())
+	}
+
+	// Clear endpoint should revert to default
+	conv.SetEndpoint("")
+	if conv.endpoint() != DefaultMessagesURI {
+		t.Errorf("Expected endpoint to revert to default, got %q", conv.endpoint())
+	}
+}
+
+// TestEndpointOverrideWithMockServer tests that endpoint override works with actual HTTP requests.
+func TestEndpointOverrideWithMockServer(t *testing.T) {
+	// Create mock server that returns a valid response
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"content": [{"type": "text", "text": "Hello from custom endpoint!"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 10, "output_tokens": 5}
+		}`))
+	}))
+	defer server.Close()
+
+	conv := NewConversation("System")
+	conv.ApiToken = "test-token"
+	conv.SetEndpoint(server.URL)
+
+	reply, _, _, _, err := conv.Send("Hello", llmapi.Sampling{})
+	if err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+
+	if reply != "Hello from custom endpoint!" {
+		t.Errorf("Expected reply from custom endpoint, got %q", reply)
 	}
 }
 
