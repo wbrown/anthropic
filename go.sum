@@ -2,3 +2,5 @@ github.com/wbrown/llmapi v0.0.0-20251220020701-84b6c40359e6 h1:SaJWlNGgQlBJ2C4qG
 github.com/wbrown/llmapi v0.0.0-20251220020701-84b6c40359e6/go.mod h1:Xfi3YTGRYZ/OuDWSFDPSW8vmIMgG1P0p4pmlggqOIos=
 github.com/wbrown/llmapi v0.0.0-20251223230745-0542ecfefb80 h1:X44XCnYriF3C/lDYT1IphAPvHsmHpyFARm6WaMbqMKc=
 github.com/wbrown/llmapi v0.0.0-20251223230745-0542ecfefb80/go.mod h1:Xfi3YTGRYZ/OuDWSFDPSW8vmIMgG1P0p4pmlggqOIos=
+github.com/wbrown/llmapi v0.0.0-20260115200758-509a51a62290 h1:L/mjQ72CjoLYLYI/dbPimxCSmkAcMoBwU81OaGd2mfs=
+github.com/wbrown/llmapi v0.0.0-20260115200758-509a51a62290/go.mod h1:Xfi3YTGRYZ/OuDWSFDPSW8vmIMgG1P0p4pmlggqOIos=
