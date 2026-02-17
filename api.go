@@ -43,7 +43,7 @@ var DefaultApiToken = ""
 // as the default settings for all Conversations, and can be overridden by
 // setting it directly.
 var DefaultSettings = SampleSettings{
-	Model:       "claude-sonnet-4-20250514",
+	Model:       "claude-sonnet-4-5-20250929",
 	Version:     "2023-06-01",
 	Beta:        "", // Beta features can be enabled per conversation
 	MaxTokens:   20000,
