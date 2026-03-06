@@ -272,6 +272,10 @@ type Conversation struct {
 	Tools []ToolDefinition
 	// ToolsCacheable indicates if tools should be cached
 	ToolsCacheable bool
+	// ConversationCacheable enables automatic cache breakpoints on conversation turns.
+	// When enabled, the last user message's last content block is marked with
+	// cache_control before each API call, so the conversation prefix is cached.
+	ConversationCacheable bool
 	// HasThinkingContent tracks if any responses included thinking blocks
 	HasThinkingContent bool
 }
@@ -388,6 +392,9 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	if sampling.TopK != 0 {
 		topK = sampling.TopK
 	}
+
+	// Apply conversation turn cache breakpoints before building the request
+	c.applyCacheBreakpoints()
 
 	messages := Messages{
 		Model:       c.Settings.Model,
@@ -570,6 +577,9 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		topK = sampling.TopK
 	}
 
+	// Apply conversation turn cache breakpoints before building the request
+	c.applyCacheBreakpoints()
+
 	messages := Messages{
 		Model:       c.Settings.Model,
 		MaxTokens:   c.Settings.MaxTokens,
@@ -740,6 +750,7 @@ func (c *Conversation) GetCapabilities() llmapi.Capabilities {
 		SupportsToolUse:     true,
 		SupportsThinking:    true,
 		SupportsStreaming:   true,
+		SupportsCaching:     true,
 		MaxImageSize:        20 * 1024 * 1024, // 20MB for now? Idk
 		SupportedImageTypes: []string{"image/jpeg", "image/png", "image/gif", "image/webp"},
 	}
@@ -883,6 +894,9 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 	if sampling.TopK != 0 {
 		topK = sampling.TopK
 	}
+
+	// Apply conversation turn cache breakpoints before building the request
+	conversation.applyCacheBreakpoints()
 
 	messages := Messages{
 		Model:       conversation.Settings.Model,
@@ -1393,12 +1407,15 @@ func (c *Conversation) CacheHitRate() float64 {
 	return float64(c.CacheStats.CacheHits) / float64(total) * 100
 }
 
-// CacheSavingsRate returns the percentage of tokens saved by caching
+// CacheSavingsRate returns the percentage of input tokens saved by caching.
+// This is calculated as tokens saved divided by the total tokens that would have
+// been charged without caching (input tokens + cache read tokens).
 func (c *Conversation) CacheSavingsRate() float64 {
-	if c.Usage.InputTokens == 0 {
+	totalWithoutCache := c.Usage.InputTokens + c.CacheStats.TotalCacheReadTokens
+	if totalWithoutCache == 0 {
 		return 0
 	}
-	return float64(c.CacheStats.TotalTokensSaved) / float64(c.Usage.InputTokens) * 100
+	return float64(c.CacheStats.TotalTokensSaved) / float64(totalWithoutCache) * 100
 }
 
 // Beta feature management
@@ -1520,14 +1537,59 @@ func ListModels(ctx context.Context, apiKey string) (*ModelsResponse, error) {
 	return &modelsResp, nil
 }
 
-// EnableSystemCaching enables caching for the system prompt
-func (c *Conversation) EnableSystemCaching() {
+// EnableSystemCaching enables caching for the system prompt.
+func (c *Conversation) EnableSystemCaching() error {
 	c.SystemCacheable = true
+	return nil
 }
 
 // EnableToolsCaching enables caching for tool definitions
 func (c *Conversation) EnableToolsCaching() {
 	c.ToolsCacheable = true
+}
+
+// EnableConversationCaching enables automatic cache breakpoints on conversation turns.
+// Before each API call, the last user message's last content block is marked with
+// cache_control so that the conversation prefix is served from cache on subsequent turns.
+func (c *Conversation) EnableConversationCaching() error {
+	c.ConversationCacheable = true
+	return nil
+}
+
+// DisableConversationCaching disables automatic conversation turn caching.
+func (c *Conversation) DisableConversationCaching() error {
+	c.ConversationCacheable = false
+	return nil
+}
+
+// applyCacheBreakpoints sets cache_control on the last user message's last content block
+// and clears any previous conversation-turn cache breakpoints. This is called automatically
+// before each API request when ConversationCacheable is true.
+func (c *Conversation) applyCacheBreakpoints() {
+	if !c.ConversationCacheable || c.Messages == nil || len(*c.Messages) == 0 {
+		return
+	}
+
+	messages := *c.Messages
+
+	// Clear existing cache_control from all message content blocks
+	for _, msg := range messages {
+		if msg.Content == nil {
+			continue
+		}
+		for j := range *msg.Content {
+			(*msg.Content)[j].CacheControl = nil
+		}
+	}
+
+	// Find the last user message and mark its last content block for caching
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" && messages[i].Content != nil && len(*messages[i].Content) > 0 {
+			blocks := *messages[i].Content
+			blocks[len(blocks)-1].EnableCaching()
+			break
+		}
+	}
 }
 
 // CacheLastNMessages enables caching on the last N messages
