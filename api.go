@@ -750,6 +750,7 @@ func (c *Conversation) GetCapabilities() llmapi.Capabilities {
 		SupportsToolUse:     true,
 		SupportsThinking:    true,
 		SupportsStreaming:   true,
+		SupportsCaching:     true,
 		MaxImageSize:        20 * 1024 * 1024, // 20MB for now? Idk
 		SupportedImageTypes: []string{"image/jpeg", "image/png", "image/gif", "image/webp"},
 	}
@@ -1536,9 +1537,10 @@ func ListModels(ctx context.Context, apiKey string) (*ModelsResponse, error) {
 	return &modelsResp, nil
 }
 
-// EnableSystemCaching enables caching for the system prompt
-func (c *Conversation) EnableSystemCaching() {
+// EnableSystemCaching enables caching for the system prompt.
+func (c *Conversation) EnableSystemCaching() error {
 	c.SystemCacheable = true
+	return nil
 }
 
 // EnableToolsCaching enables caching for tool definitions
@@ -1549,13 +1551,15 @@ func (c *Conversation) EnableToolsCaching() {
 // EnableConversationCaching enables automatic cache breakpoints on conversation turns.
 // Before each API call, the last user message's last content block is marked with
 // cache_control so that the conversation prefix is served from cache on subsequent turns.
-func (c *Conversation) EnableConversationCaching() {
+func (c *Conversation) EnableConversationCaching() error {
 	c.ConversationCacheable = true
+	return nil
 }
 
 // DisableConversationCaching disables automatic conversation turn caching.
-func (c *Conversation) DisableConversationCaching() {
+func (c *Conversation) DisableConversationCaching() error {
 	c.ConversationCacheable = false
+	return nil
 }
 
 // applyCacheBreakpoints sets cache_control on the last user message's last content block
