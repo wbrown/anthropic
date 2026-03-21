@@ -43,7 +43,7 @@ var DefaultApiToken = ""
 // as the default settings for all Conversations, and can be overridden by
 // setting it directly.
 var DefaultSettings = SampleSettings{
-	Model:       "claude-sonnet-4-5-20250929",
+	Model:       "claude-sonnet-4-6",
 	Version:     "2023-06-01",
 	Beta:        "", // Beta features can be enabled per conversation
 	MaxTokens:   20000,
@@ -1159,7 +1159,7 @@ func (conversation *Conversation) SendUntilDone(text string, sampling llmapi.Sam
 		if stopReason != "max_tokens" {
 			done = true
 		} else {
-			input = ""
+			input = "Continue."
 		}
 	}
 	return output, stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, nil
@@ -1201,8 +1201,8 @@ func (conversation *Conversation) SendStreamingUntilDone(text string, sampling l
 			break
 		}
 
-		// Continue generation with empty input (picks up from last assistant message)
-		input = ""
+		// Continue generation with a user message (prefill not supported by all models)
+		input = "Continue."
 	}
 
 	return totalReply.String(), stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, nil
