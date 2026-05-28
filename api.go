@@ -106,9 +106,12 @@ type SystemPrompt struct {
 // Messages is a sequence of messages in a conversation. It usually starts with
 // a user message, and alternates between user and assistant messages.
 type Messages struct {
-	Model       string           `json:"model"`
-	MaxTokens   int              `json:"max_tokens"`
-	Temperature float64          `json:"temperature"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	// Temperature is a pointer so the field can be omitted entirely from the
+	// JSON body — Claude Opus 4.7 and later reject any temperature key (the
+	// check is presence-based, not value-based). See supportsSampling.
+	Temperature *float64         `json:"temperature,omitempty"`
 	TopP        float64          `json:"top_p,omitempty"`
 	TopK        int              `json:"top_k,omitempty"`
 	System      interface{}      `json:"system,omitempty"` // Can be string or []SystemPrompt
@@ -379,19 +382,10 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	// Note: The API doesn't support caching individual tools, only the entire tools array
 	// Tool caching is handled at the API level, not per-tool
 
-	// Use sampling overrides if provided (non-zero), otherwise use conversation defaults
-	temperature := c.Settings.Temperature
-	if sampling.Temperature != 0 {
-		temperature = sampling.Temperature
-	}
-	topP := c.Settings.TopP
-	if sampling.TopP != 0 {
-		topP = sampling.TopP
-	}
-	topK := c.Settings.TopK
-	if sampling.TopK != 0 {
-		topK = sampling.TopK
-	}
+	// Resolve sampling parameters, layering per-call overrides over conversation
+	// defaults and dropping them entirely on models that no longer accept them
+	// (Claude Opus 4.7+; see supportsSampling).
+	temperature, topP, topK := resolveSampling(c.Settings, sampling)
 
 	// Apply conversation turn cache breakpoints before building the request
 	c.applyCacheBreakpoints()
@@ -563,19 +557,8 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		}
 	}
 
-	// Use sampling overrides if provided
-	temperature := c.Settings.Temperature
-	if sampling.Temperature != 0 {
-		temperature = sampling.Temperature
-	}
-	topP := c.Settings.TopP
-	if sampling.TopP != 0 {
-		topP = sampling.TopP
-	}
-	topK := c.Settings.TopK
-	if sampling.TopK != 0 {
-		topK = sampling.TopK
-	}
+	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits them).
+	temperature, topP, topK := resolveSampling(c.Settings, sampling)
 
 	// Apply conversation turn cache breakpoints before building the request
 	c.applyCacheBreakpoints()
@@ -881,19 +864,8 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		}
 	}
 
-	// Use sampling overrides if provided (non-zero), otherwise use conversation defaults
-	temperature := conversation.Settings.Temperature
-	if sampling.Temperature != 0 {
-		temperature = sampling.Temperature
-	}
-	topP := conversation.Settings.TopP
-	if sampling.TopP != 0 {
-		topP = sampling.TopP
-	}
-	topK := conversation.Settings.TopK
-	if sampling.TopK != 0 {
-		topK = sampling.TopK
-	}
+	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits them).
+	temperature, topP, topK := resolveSampling(conversation.Settings, sampling)
 
 	// Apply conversation turn cache breakpoints before building the request
 	conversation.applyCacheBreakpoints()
