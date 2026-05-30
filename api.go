@@ -327,6 +327,20 @@ func NewConversation(system string) *Conversation {
 	return &conversation
 }
 
+// hasToolUseBlock reports whether the message contains a tool_use block — an open tool call
+// awaiting the client's tool_result. Such a turn cannot be continued with an empty-text send.
+func hasToolUseBlock(m *Message) bool {
+	if m == nil || m.Content == nil {
+		return false
+	}
+	for _, block := range *m.Content {
+		if block.ContentType == "tool_use" {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Response, error) {
 	if c.Settings == nil {
 		return nil, fmt.Errorf("conversation settings not set")
@@ -336,28 +350,22 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	}
 	if text != "" {
 		c.AddMessage(llmapi.RoleUser, text)
-	} else if len(*c.Messages) > 2 &&
-		(*c.Messages)[len(*c.Messages)-1].Role !=
-			"assistant" {
-		// Check if the last user message contains tool results
-		lastMsg := (*c.Messages)[len(*c.Messages)-1]
-		if lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0 {
-			// Check if this is a tool result message
-			hasToolResult := false
-			for _, block := range *lastMsg.Content {
-				if block.ContentType == "tool_result" {
-					hasToolResult = true
-					break
-				}
-			}
-			if !hasToolResult {
-				// If the text is empty, and the last message is not from the
-				// assistant, we can't continue the conversation, so return
+	} else if n := len(*c.Messages); n > 0 {
+		// Empty text means "send the conversation as it stands." Validate the trailing turn:
+		//   - assistant turn → continue (prefill), UNLESS it is an open tool_use request
+		//     (awaiting the client's tool_result); that can't be continued → reject, at any length.
+		//   - user turn with content (plain text or a tool_result) → respond → send, but only past
+		//     the opening exchange (the > 2 gate; the first user turn is a valid initial send).
+		//   - a user turn with no content (or any other trailing turn) → nothing to answer → reject.
+		lastMsg := (*c.Messages)[n-1]
+		if lastMsg.Role == "assistant" {
+			if hasToolUseBlock(lastMsg) {
 				return nil, fmt.Errorf("cannot continue conversation")
 			}
-			// If it's a tool result, allow continuation
-		} else {
-			return nil, fmt.Errorf("cannot continue conversation")
+		} else if n > 2 {
+			if !(lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0) {
+				return nil, fmt.Errorf("cannot continue conversation")
+			}
 		}
 	}
 
@@ -830,22 +838,19 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 	// Add user message if provided
 	if text != "" {
 		conversation.AddMessage(llmapi.RoleUser, text)
-	} else if len(*conversation.Messages) > 0 &&
-		(*conversation.Messages)[len(*conversation.Messages)-1].Role != "assistant" {
-		// Check if the last user message contains tool results
-		lastMsg := (*conversation.Messages)[len(*conversation.Messages)-1]
-		if lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0 {
-			hasToolResult := false
-			for _, block := range *lastMsg.Content {
-				if block.ContentType == "tool_result" {
-					hasToolResult = true
-					break
-				}
-			}
-			if !hasToolResult {
+	} else if n := len(*conversation.Messages); n > 0 {
+		// Empty text means "send the conversation as it stands." Validate the trailing turn:
+		//   - assistant turn → continue (prefill), UNLESS it is an open tool_use request
+		//     (awaiting the client's tool_result); that can't be continued → reject.
+		//   - user turn with content → respond → send. Content may be plain text (e.g. a turn
+		//     left queued by a failed send and now retried) or a tool_result; the API accepts either.
+		//   - a user turn with no content (or any other trailing turn) → nothing to answer → reject.
+		lastMsg := (*conversation.Messages)[n-1]
+		if lastMsg.Role == "assistant" {
+			if hasToolUseBlock(lastMsg) {
 				return "", "", 0, 0, 0, 0, fmt.Errorf("cannot continue conversation")
 			}
-		} else {
+		} else if !(lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0) {
 			return "", "", 0, 0, 0, 0, fmt.Errorf("cannot continue conversation")
 		}
 	}
