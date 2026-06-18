@@ -227,14 +227,39 @@ type SampleSettings struct {
 	TopP float64 `json:"top_p,omitempty"`
 	// TopK limits sampling to the top K tokens.
 	TopK int `json:"top_k,omitempty"`
-	// Thinking configuration for extended reasoning
-	Thinking *ThinkingConfig `json:"thinking,omitempty"`
 }
 
 // ThinkingConfig configures extended thinking for Claude
 type ThinkingConfig struct {
 	Type         string `json:"type"`          // "enabled"
 	BudgetTokens int    `json:"budget_tokens"` // minimum 1024
+}
+
+// thinkingForEffort maps a requested reasoning effort to Claude's extended-thinking
+// config. ReasoningOff returns nil (no extended thinking); low is the 1024 floor,
+// and medium/high/max scale the budget to 1/4, 1/2, 3/4 of maxTokens. The budget
+// must stay under maxTokens, so a maxTokens too small to fit a >=1024 budget under
+// max_tokens is an error.
+func thinkingForEffort(effort llmapi.ReasoningEffort, maxTokens int) (*ThinkingConfig, error) {
+	if effort == llmapi.ReasoningOff {
+		return nil, nil
+	}
+	budget := 1024
+	switch effort {
+	case llmapi.ReasoningMedium:
+		budget = maxTokens / 4
+	case llmapi.ReasoningHigh:
+		budget = maxTokens / 2
+	case llmapi.ReasoningMax:
+		budget = maxTokens * 3 / 4
+	}
+	if budget < 1024 {
+		budget = 1024
+	}
+	if budget >= maxTokens {
+		return nil, fmt.Errorf("reasoning effort %s needs max_tokens > %d to fit a thinking budget under max_tokens, got max_tokens=%d", effort, budget, maxTokens)
+	}
+	return &ThinkingConfig{Type: "enabled", BudgetTokens: budget}, nil
 }
 
 // A Conversation is a sequence of messages between a user and an assistant.
@@ -395,6 +420,11 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	// (Claude Opus 4.7+; see supportsSampling).
 	temperature, topP, topK := resolveSampling(c.Settings, sampling)
 
+	thinkingCfg, thinkErr := thinkingForEffort(sampling.ReasoningEffort, c.Settings.MaxTokens)
+	if thinkErr != nil {
+		return nil, thinkErr
+	}
+
 	// Apply conversation turn cache breakpoints before building the request
 	c.applyCacheBreakpoints()
 
@@ -407,7 +437,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		System:      system,
 		Messages:    c.Messages,
 		Tools:       tools,
-		Thinking:    c.Settings.Thinking,
+		Thinking:    thinkingCfg,
 	}
 
 	// Marshal messages to JSON
@@ -568,6 +598,11 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits them).
 	temperature, topP, topK := resolveSampling(c.Settings, sampling)
 
+	thinkingCfg, thinkErr := thinkingForEffort(sampling.ReasoningEffort, c.Settings.MaxTokens)
+	if thinkErr != nil {
+		return nil, thinkErr
+	}
+
 	// Apply conversation turn cache breakpoints before building the request
 	c.applyCacheBreakpoints()
 
@@ -580,7 +615,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		System:      system,
 		Messages:    c.Messages,
 		Tools:       c.Tools,
-		Thinking:    c.Settings.Thinking,
+		Thinking:    thinkingCfg,
 		Stream:      true,
 	}
 
@@ -872,6 +907,11 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits them).
 	temperature, topP, topK := resolveSampling(conversation.Settings, sampling)
 
+	thinkingCfg, thinkErr := thinkingForEffort(sampling.ReasoningEffort, conversation.Settings.MaxTokens)
+	if thinkErr != nil {
+		return "", "", 0, 0, 0, 0, thinkErr
+	}
+
 	// Apply conversation turn cache breakpoints before building the request
 	conversation.applyCacheBreakpoints()
 
@@ -884,7 +924,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		System:      system,
 		Messages:    conversation.Messages,
 		Tools:       conversation.Tools,
-		Thinking:    conversation.Settings.Thinking,
+		Thinking:    thinkingCfg,
 		Stream:      true,
 	}
 
@@ -1055,13 +1095,14 @@ func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback ll
 				case "text_delta":
 					textBuilder.WriteString(event.Delta.Text)
 					if callback != nil {
-						callback(event.Delta.Text, false)
+						callback(llmapi.StreamDelta{Text: event.Delta.Text, Kind: llmapi.TokenContent})
 					}
 				case "thinking_delta":
 					thinkingBuilder.WriteString(event.Delta.Thinking)
-					// Optionally stream thinking to callback too
+					// Stream thinking to the callback tagged as reasoning so consumers
+					// can route it separately from content.
 					if callback != nil && event.Delta.Thinking != "" {
-						callback(event.Delta.Thinking, false)
+						callback(llmapi.StreamDelta{Text: event.Delta.Thinking, Kind: llmapi.TokenReasoning})
 					}
 				}
 			}
@@ -1082,7 +1123,7 @@ func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback ll
 		case "message_stop":
 			// Stream complete - signal done to callback
 			if callback != nil {
-				callback("", true)
+				callback(llmapi.StreamDelta{Done: true})
 			}
 		}
 	}
@@ -1238,8 +1279,8 @@ func (conversation *Conversation) GetMessages() []llmapi.Message {
 // This includes all input and output tokens across all Send calls.
 func (conversation *Conversation) GetUsage() llmapi.Usage {
 	return llmapi.Usage{
-		InputTokens:             conversation.Usage.InputTokens,
-		OutputTokens:            conversation.Usage.OutputTokens,
+		InputTokens:              conversation.Usage.InputTokens,
+		OutputTokens:             conversation.Usage.OutputTokens,
 		CacheCreationInputTokens: conversation.CacheStats.TotalCacheCreationTokens,
 		CacheReadInputTokens:     conversation.CacheStats.TotalCacheReadTokens,
 	}
@@ -1430,22 +1471,6 @@ func (c *Conversation) DisableBeta(beta string) {
 	}
 
 	c.Settings.Beta = strings.Join(newBetas, ",")
-}
-
-// EnableThinking enables extended thinking with the specified token budget
-func (c *Conversation) EnableThinking(budgetTokens int) {
-	if c.Settings == nil {
-		settings := DefaultSettings
-		c.Settings = &settings
-	}
-
-	if budgetTokens < 1024 {
-		budgetTokens = 1024 // Minimum required
-	}
-	c.Settings.Thinking = &ThinkingConfig{
-		Type:         "enabled",
-		BudgetTokens: budgetTokens,
-	}
 }
 
 // Model represents an available Claude model

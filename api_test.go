@@ -51,8 +51,8 @@ func TestConversation_SendStreaming(t *testing.T) {
 
 	// Track how many times the callback is invoked with content
 	var tokenCount int
-	callback := func(text string, done bool) {
-		if !done && text != "" {
+	callback := func(d llmapi.StreamDelta) {
+		if !d.Done && d.Text != "" {
 			tokenCount++
 		}
 	}
@@ -118,8 +118,8 @@ func TestConversation_SendStreamingUntilDone(t *testing.T) {
 	conversation.Settings.MaxTokens = 125
 
 	var tokenCount int
-	callback := func(text string, done bool) {
-		if !done && text != "" {
+	callback := func(d llmapi.StreamDelta) {
+		if !d.Done && d.Text != "" {
 			tokenCount++
 		}
 	}
@@ -543,8 +543,8 @@ func TestConversationCaching_StreamingIntegration(t *testing.T) {
 
 	for i, turn := range turns {
 		var tokenCount int
-		callback := func(text string, done bool) {
-			if !done && text != "" {
+		callback := func(d llmapi.StreamDelta) {
+			if !d.Done && d.Text != "" {
 				tokenCount++
 			}
 		}
@@ -904,9 +904,9 @@ data: {"type":"message_stop"}
 	conv := NewConversation("Test")
 	var callbackText string
 	var callbackDone bool
-	callback := func(text string, done bool) {
-		callbackText += text
-		callbackDone = done
+	callback := func(d llmapi.StreamDelta) {
+		callbackText += d.Text
+		callbackDone = d.Done
 	}
 
 	reader := strings.NewReader(sseData)
@@ -1217,8 +1217,8 @@ func TestContextCancellationMidStream(t *testing.T) {
 	var cancelled bool
 
 	// Cancel after receiving some tokens
-	callback := func(text string, done bool) {
-		if done {
+	callback := func(d llmapi.StreamDelta) {
+		if d.Done {
 			return
 		}
 		tokensReceived++
