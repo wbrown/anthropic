@@ -18,7 +18,8 @@ import (
 
 // decodedThinkingFields is the subset of the request body this file inspects.
 type decodedThinkingFields struct {
-	Thinking *struct {
+	MaxTokens int `json:"max_tokens"`
+	Thinking  *struct {
 		Type         string `json:"type"`
 		BudgetTokens int    `json:"budget_tokens"`
 		Display      string `json:"display"`
@@ -221,6 +222,106 @@ func TestSendInternal_GatesThinkingByModel(t *testing.T) {
 		// only forfeit visibility into reasoning that happens (and is billed)
 		// either way. Effort is "low" since the caller asked for nothing.
 		assertAdaptiveThinking(t, captured, "low", "fable-5 Send with ReasoningOff")
+	})
+}
+
+// TestSend_WireMaxTokens pins the wire max_tokens computation across all
+// three send paths: the request's max_tokens is the desired output (per-call
+// Sampling.DesiredOutputTokens, else Settings.MaxTokens) plus the effective
+// thinking mode's reasoning headroom, clamped to the model's output ceiling.
+// Settings.MaxTokens is the default DESIRED OUTPUT, not the wire value — the
+// wire value is computed from it.
+func TestSend_WireMaxTokens(t *testing.T) {
+	send := func(t *testing.T, model string, settingsMaxTokens int, sampling llmapi.Sampling) []byte {
+		t.Helper()
+		var captured []byte
+		server := stubMessagesServer(t, &captured)
+		defer server.Close()
+
+		conv := NewConversation("sys")
+		conv.ApiToken = "test-token"
+		conv.SetEndpoint(server.URL)
+		conv.Settings.Model = model
+		conv.Settings.MaxTokens = settingsMaxTokens
+
+		if _, _, _, _, _, _, err := conv.Send("hello", sampling); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		return captured
+	}
+
+	t.Run("adaptive effort adds headroom to the settings default", func(t *testing.T) {
+		body := send(t, "claude-opus-4-8", 8192, llmapi.Sampling{ReasoningEffort: llmapi.ReasoningHigh})
+		if got := decodeThinkingFields(t, body, "opus-4-8 high").MaxTokens; got != 24576 {
+			t.Errorf("max_tokens = %d, want 24576 (8192 desired + 16384 high headroom)", got)
+		}
+	})
+
+	t.Run("per-call DesiredOutputTokens overrides the settings default", func(t *testing.T) {
+		body := send(t, "claude-opus-4-8", 8192, llmapi.Sampling{ReasoningEffort: llmapi.ReasoningHigh, DesiredOutputTokens: 4096})
+		if got := decodeThinkingFields(t, body, "opus-4-8 high desired-override").MaxTokens; got != 20480 {
+			t.Errorf("max_tokens = %d, want 20480 (4096 desired + 16384 high headroom)", got)
+		}
+	})
+
+	t.Run("disabled thinking reserves nothing on sonnet-5", func(t *testing.T) {
+		body := send(t, "claude-sonnet-5", 8192, llmapi.Sampling{})
+		if got := decodeThinkingFields(t, body, "sonnet-5 off").MaxTokens; got != 8192 {
+			t.Errorf("max_tokens = %d, want 8192 (desired only; thinking disabled)", got)
+		}
+	})
+
+	t.Run("always-thinking model reserves low headroom at caller-off", func(t *testing.T) {
+		body := send(t, "claude-fable-5", 8192, llmapi.Sampling{})
+		if got := decodeThinkingFields(t, body, "fable-5 off").MaxTokens; got != 12288 {
+			t.Errorf("max_tokens = %d, want 12288 (8192 desired + 4096 low headroom for unavoidable thinking)", got)
+		}
+	})
+
+	t.Run("ceiling clamps the wire total", func(t *testing.T) {
+		body := send(t, "claude-opus-4-8", 100000, llmapi.Sampling{ReasoningEffort: llmapi.ReasoningMax})
+		if got := decodeThinkingFields(t, body, "opus-4-8 max clamp").MaxTokens; got != 128000 {
+			t.Errorf("max_tokens = %d, want 128000 (ceiling)", got)
+		}
+	})
+
+	t.Run("SendStreaming computes the same wire budget", func(t *testing.T) {
+		var captured []byte
+		server := stubStreamingServer(t, &captured)
+		defer server.Close()
+
+		conv := NewConversation("sys")
+		conv.ApiToken = "test-token"
+		conv.SetEndpoint(server.URL)
+		conv.Settings.Model = "claude-opus-4-8"
+		conv.Settings.MaxTokens = 8192
+
+		if _, _, _, _, _, _, err := conv.SendStreaming("hello", llmapi.Sampling{ReasoningEffort: llmapi.ReasoningHigh, DesiredOutputTokens: 4096}, nil); err != nil {
+			t.Fatalf("SendStreaming: %v", err)
+		}
+		if got := decodeThinkingFields(t, captured, "streaming wire budget").MaxTokens; got != 20480 {
+			t.Errorf("max_tokens = %d, want 20480 (4096 desired + 16384 high headroom)", got)
+		}
+	})
+
+	t.Run("SendRichStreaming computes the same wire budget", func(t *testing.T) {
+		var captured []byte
+		server := stubStreamingServer(t, &captured)
+		defer server.Close()
+
+		conv := NewConversation("sys")
+		conv.ApiToken = "test-token"
+		conv.SetEndpoint(server.URL)
+		conv.Settings.Model = "claude-opus-4-8"
+		conv.Settings.MaxTokens = 8192
+
+		content := []llmapi.ContentBlock{llmapi.NewTextBlock("hello")}
+		if _, err := conv.SendRichStreaming(content, llmapi.Sampling{ReasoningEffort: llmapi.ReasoningHigh, DesiredOutputTokens: 4096}, nil); err != nil {
+			t.Fatalf("SendRichStreaming: %v", err)
+		}
+		if got := decodeThinkingFields(t, captured, "rich streaming wire budget").MaxTokens; got != 20480 {
+			t.Errorf("max_tokens = %d, want 20480 (4096 desired + 16384 high headroom)", got)
+		}
 	})
 }
 
