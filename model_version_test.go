@@ -116,6 +116,138 @@ func TestSupportsSampling(t *testing.T) {
 	}
 }
 
+// TestSupportsAdaptiveThinking locks in the adaptive-thinking cutoff: models
+// at version 4.6 or newer report true, models older than that report false,
+// and unrecognized model IDs report false (conservative default — this
+// library's pre-existing budget-based thinking behavior for a model it
+// doesn't recognize, rather than guessing at a request shape that may not be
+// supported at all).
+func TestSupportsAdaptiveThinking(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		// Supports adaptive thinking (>= 4.6)
+		{"claude-opus-4-8", true},
+		{"claude-opus-4-7", true},
+		{"claude-opus-4-6", true},
+		{"claude-sonnet-4-6", true},
+		{"claude-sonnet-5", true},
+		{"claude-fable-5", true},
+		{"claude-mythos-5", true},
+
+		// Hypothetical future bumps follow the same rule family-agnostically.
+		{"claude-haiku-5-0", true},
+		{"claude-opus-5-0", true},
+
+		// Legacy budget-based thinking only (< 4.6)
+		{"claude-opus-4-5", false},
+		{"claude-opus-4-1", false},
+		{"claude-opus-4-0", false},
+		{"claude-sonnet-4-5", false},
+		{"claude-haiku-4-5", false},
+		{"claude-haiku-4-5-20251001", false},
+		{"claude-3-7-sonnet-20250219", false},
+		{"claude-3-5-sonnet-20241022", false},
+		{"claude-3-opus-20240229", false},
+		{"claude-2.1", false},
+		{"claude-instant-1.2", false},
+
+		// Unrecognized → false (conservative)
+		{"", false},
+		{"gpt-4", false},
+		{"claude-future-model-xyz", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := supportsAdaptiveThinking(tc.model); got != tc.want {
+				t.Errorf("supportsAdaptiveThinking(%q) = %v, want %v", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMustAlwaysThink locks in the always-on-thinking family: only Fable 5
+// and Mythos 5 name a model that cannot be made to stop thinking. This is a
+// family match, not a version cutoff — a hypothetical claude-opus-5-0 must
+// NOT be swept in just because it shares Fable/Mythos's major version.
+func TestMustAlwaysThink(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"claude-fable-5", true},
+		{"claude-mythos-5", true},
+
+		// Same major version, different family — must NOT match.
+		{"claude-sonnet-5", false},
+		{"claude-opus-5-0", false},
+
+		// Everything else this library recognizes can genuinely stop thinking.
+		{"claude-opus-4-8", false},
+		{"claude-opus-4-7", false},
+		{"claude-opus-4-6", false},
+		{"claude-sonnet-4-6", false},
+		{"claude-sonnet-4-5", false},
+		{"claude-haiku-4-5", false},
+		{"", false},
+		{"gpt-4", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := mustAlwaysThink(tc.model); got != tc.want {
+				t.Errorf("mustAlwaysThink(%q) = %v, want %v", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDefaultsToAdaptiveThinking locks in which disableable models run
+// adaptive thinking when the request OMITS the thinking field. Claude Sonnet 5
+// does (omission = adaptive on); Opus 4.6-4.8 and Sonnet 4.6 do not (omission
+// = thinking off). The always-thinking family (Fable/Mythos) is out of this
+// predicate's scope — those cannot be disabled at all and report false here;
+// mustAlwaysThink handles them first.
+func TestDefaultsToAdaptiveThinking(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		// Sonnet 5+: omitting the thinking field runs adaptive thinking.
+		{"claude-sonnet-5", true},
+		{"claude-sonnet-5-1", true},
+
+		// Sonnet 4.x: omission = off.
+		{"claude-sonnet-4-6", false},
+		{"claude-sonnet-4-5", false},
+
+		// Opus 4.6-4.8: omission = off (explicitly documented for 4.7/4.8).
+		{"claude-opus-4-8", false},
+		{"claude-opus-4-7", false},
+		{"claude-opus-4-6", false},
+
+		// Always-thinking family: not this predicate's concern (cannot disable).
+		{"claude-fable-5", false},
+		{"claude-mythos-5", false},
+
+		// Other families and unrecognized IDs → false (conservative).
+		{"claude-haiku-4-5", false},
+		{"claude-opus-5-0", false},
+		{"", false},
+		{"gpt-4", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := defaultsToAdaptiveThinking(tc.model); got != tc.want {
+				t.Errorf("defaultsToAdaptiveThinking(%q) = %v, want %v", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestResolveSampling_UnsupportedModelOmitsAll verifies that on an unsupported
 // model all three sampling params are zeroed (Temperature returns nil so the
 // pointer omits the field; TopP and TopK return 0 so omitempty drops them).
@@ -128,7 +260,7 @@ func TestResolveSampling_UnsupportedModelOmitsAll(t *testing.T) {
 	}
 	override := llmapi.Sampling{Temperature: 0.5, TopP: 0.8, TopK: 20}
 
-	temperature, topP, topK := resolveSampling(settings, override)
+	temperature, topP, topK := resolveSampling(settings, override, false)
 
 	if temperature != nil {
 		t.Errorf("Temperature should be nil for opus-4-8, got %v", *temperature)
@@ -150,13 +282,19 @@ func TestResolveSampling_SupportedModelKeepsZeroTemperature(t *testing.T) {
 		Model:       "claude-sonnet-4-6",
 		Temperature: 0.0,
 	}
-	temperature, _, _ := resolveSampling(settings, llmapi.Sampling{})
+	temperature, topP, topK := resolveSampling(settings, llmapi.Sampling{}, false)
 
 	if temperature == nil {
 		t.Fatal("Temperature must be non-nil on supported model even when value is 0")
 	}
 	if *temperature != 0 {
 		t.Errorf("Temperature = %v, want 0", *temperature)
+	}
+	if topP != 0 {
+		t.Errorf("TopP = %v, want 0 (unset in settings)", topP)
+	}
+	if topK != 0 {
+		t.Errorf("TopK = %v, want 0 (unset in settings)", topK)
 	}
 }
 
@@ -171,7 +309,7 @@ func TestResolveSampling_OverrideAppliedOnSupportedModel(t *testing.T) {
 	}
 	override := llmapi.Sampling{Temperature: 0.7, TopP: 0.9, TopK: 50}
 
-	temperature, topP, topK := resolveSampling(settings, override)
+	temperature, topP, topK := resolveSampling(settings, override, false)
 	if temperature == nil || *temperature != 0.7 {
 		t.Errorf("Temperature = %v, want 0.7", temperature)
 	}
@@ -193,7 +331,7 @@ func TestResolveSampling_DefaultUsedWhenOverrideZero(t *testing.T) {
 		TopP:        0.6,
 		TopK:        30,
 	}
-	temperature, topP, topK := resolveSampling(settings, llmapi.Sampling{})
+	temperature, topP, topK := resolveSampling(settings, llmapi.Sampling{}, false)
 
 	if temperature == nil || *temperature != 0.4 {
 		t.Errorf("Temperature = %v, want 0.4 from settings", temperature)
@@ -217,7 +355,7 @@ func TestResolveSampling_UnrecognizedModelOmitsAll(t *testing.T) {
 		TopP:        0.9,
 		TopK:        40,
 	}
-	temperature, topP, topK := resolveSampling(settings, llmapi.Sampling{})
+	temperature, topP, topK := resolveSampling(settings, llmapi.Sampling{}, false)
 
 	if temperature != nil {
 		t.Errorf("Temperature should be nil for unrecognized model, got %v", *temperature)
@@ -227,5 +365,35 @@ func TestResolveSampling_UnrecognizedModelOmitsAll(t *testing.T) {
 	}
 	if topK != 0 {
 		t.Errorf("TopK should be 0 for unrecognized model, got %v", topK)
+	}
+}
+
+// TestResolveSampling_ThinkingActiveOmitsAll pins the constraint the real API
+// enforces (discovered via TestSendRich_AdaptiveThinking_RealReasoning in
+// api_test.go, which got a live 400 before this gate existed): "temperature
+// may only be set to 1 when thinking is enabled or in adaptive mode". A model
+// that fully supports sampling (claude-sonnet-4-6, well under the 4.7+
+// supportsSampling cutoff) must still omit all three sampling params — even
+// an explicit override — the moment thinking is active, exactly as it would
+// for an unsupported model.
+func TestResolveSampling_ThinkingActiveOmitsAll(t *testing.T) {
+	settings := &SampleSettings{
+		Model:       "claude-sonnet-4-6",
+		Temperature: 0.7,
+		TopP:        0.9,
+		TopK:        40,
+	}
+	override := llmapi.Sampling{Temperature: 0.5, TopP: 0.8, TopK: 20, ReasoningEffort: llmapi.ReasoningHigh}
+
+	temperature, topP, topK := resolveSampling(settings, override, true)
+
+	if temperature != nil {
+		t.Errorf("Temperature should be nil when thinking is active, got %v", *temperature)
+	}
+	if topP != 0 {
+		t.Errorf("TopP should be 0 when thinking is active, got %v", topP)
+	}
+	if topK != 0 {
+		t.Errorf("TopK should be 0 when thinking is active, got %v", topK)
 	}
 }

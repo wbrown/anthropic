@@ -114,11 +114,12 @@ type Messages struct {
 	Temperature *float64         `json:"temperature,omitempty"`
 	TopP        float64          `json:"top_p,omitempty"`
 	TopK        int              `json:"top_k,omitempty"`
-	System      interface{}      `json:"system,omitempty"` // Can be string or []SystemPrompt
-	Messages    *[]*Message      `json:"messages"`
-	Tools       []ToolDefinition `json:"tools,omitempty"`
-	Thinking    *ThinkingConfig  `json:"thinking,omitempty"`
-	Stream      bool             `json:"stream,omitempty"`
+	System       interface{}      `json:"system,omitempty"` // Can be string or []SystemPrompt
+	Messages     *[]*Message      `json:"messages"`
+	Tools        []ToolDefinition `json:"tools,omitempty"`
+	Thinking     *ThinkingConfig  `json:"thinking,omitempty"`
+	OutputConfig *OutputConfig    `json:"output_config,omitempty"`
+	Stream       bool             `json:"stream,omitempty"`
 }
 
 // ContentSource is the encoded data for the content block. It is presently
@@ -193,12 +194,14 @@ type StreamEvent struct {
 }
 
 // StreamDelta contains incremental content updates from streaming responses.
-// For content_block_delta events, Text contains the new text fragment.
+// For content_block_delta events, Text/Thinking/Signature contain the new
+// fragment for a text_delta/thinking_delta/signature_delta respectively.
 // For message_delta events, StopReason contains the final stop reason.
 type StreamDelta struct {
 	Type        string  `json:"type,omitempty"`
 	Text        string  `json:"text,omitempty"`
 	Thinking    string  `json:"thinking,omitempty"`
+	Signature   string  `json:"signature,omitempty"` // thinking block verification (signature_delta)
 	PartialJSON string  `json:"partial_json,omitempty"`
 	StopReason  *string `json:"stop_reason,omitempty"`
 }
@@ -229,35 +232,114 @@ type SampleSettings struct {
 	TopK int `json:"top_k,omitempty"`
 }
 
-// ThinkingConfig configures extended thinking for Claude
+// ThinkingConfig configures extended thinking for Claude. Type is "adaptive"
+// on models that support it (see supportsAdaptiveThinking) — BudgetTokens is
+// left zero and omitted, Display is set to "summarized" — or "enabled" with
+// BudgetTokens set on older models, which don't get Display, or "disabled"
+// (both other fields omitted) to turn thinking off on models where merely
+// omitting the field would run adaptive thinking anyway (see
+// defaultsToAdaptiveThinking and thinkingForEffort).
 type ThinkingConfig struct {
-	Type         string `json:"type"`          // "enabled"
-	BudgetTokens int    `json:"budget_tokens"` // minimum 1024
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"` // "enabled" only; minimum 1024
+	Display      string `json:"display,omitempty"`       // "adaptive" only; see thinkingForEffort
 }
 
-// thinkingForEffort maps a requested reasoning effort to Claude's extended-thinking
-// config. ReasoningOff returns nil (no extended thinking); low is the 1024 floor,
-// and medium/high/max scale the budget to 1/4, 1/2, 3/4 of maxTokens. The budget
-// must stay under maxTokens, so a maxTokens too small to fit a >=1024 budget under
-// max_tokens is an error.
-func thinkingForEffort(effort llmapi.ReasoningEffort, maxTokens int) (*ThinkingConfig, error) {
+// active reports whether this config actually turns thinking on. An explicit
+// {type: "disabled"} — sent on models whose omission-default is adaptive-on —
+// means thinking is OFF, so sampling parameters remain sendable on models
+// that accept them (see resolveSampling); nil means the field is omitted.
+func (t *ThinkingConfig) active() bool {
+	return t != nil && t.Type != "disabled"
+}
+
+// OutputConfig carries response-shaping options separate from the
+// conversation-level model parameters. Effort controls adaptive-thinking
+// depth (and overall token spend) on models where ThinkingConfig.Type is
+// "adaptive"; it has no effect otherwise and is left unset.
+type OutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// legacyThinkingBudgets gives each reasoning-effort level a fixed,
+// approximate extended-thinking budget for models that only accept the
+// legacy thinking: {type: "enabled", budget_tokens: N} shape (see
+// supportsAdaptiveThinking). These are flat approximations, not scaled to a
+// particular MaxTokens — the same low/medium/high/max shorthand that
+// Anthropic's own output_config.effort and wbrown/openai's reasoning_effort
+// chat-template kwarg use, so a caller picks one effort level and each
+// provider approximates it in its own native terms.
+var legacyThinkingBudgets = map[llmapi.ReasoningEffort]int{
+	llmapi.ReasoningLow:    1024,
+	llmapi.ReasoningMedium: 4096,
+	llmapi.ReasoningHigh:   8192,
+	llmapi.ReasoningMax:    16384,
+}
+
+// thinkingForEffort maps a requested reasoning effort to Claude's thinking
+// (and, on models that require it, output_config.effort) request fields.
+//
+// ReasoningOff omits thinking entirely on every model EXCEPT two groups whose
+// omission-default is not "off":
+//
+//   - The mustAlwaysThink family (Claude Fable 5, Claude Mythos 5) thinks
+//     unconditionally regardless of what's sent, so omitting the field doesn't
+//     save anything — it only forfeits visibility, since thinking.display then
+//     defaults to "omitted" (real, billed reasoning comes back as empty-text
+//     blocks). For those models, ReasoningOff still requests display:
+//     "summarized" at the lowest effort level: the caller didn't ask for
+//     reasoning, so don't spend more on it than necessary, but don't let
+//     unavoidable reasoning go unrecorded either.
+//
+//   - The defaultsToAdaptiveThinking family (Claude Sonnet 5) runs adaptive
+//     thinking whenever the field is omitted — billed, slow, and invisible
+//     (no display parameter accompanies an omitted field). Unlike Fable/
+//     Mythos it CAN be turned off, so ReasoningOff sends an explicit
+//     thinking: {type: "disabled"}.
+//
+// Any other level turns thinking on: on models that support adaptive
+// thinking (see supportsAdaptiveThinking), that means thinking: {type:
+// "adaptive"} paired with output_config.effort set to the requested level
+// directly — Anthropic's low/medium/high/max effort levels are the same
+// four llmapi.ReasoningEffort exposes, so no translation table is needed
+// beyond effort.String().
+//
+// Display is forced to "summarized" on the adaptive path. Anthropic's
+// thinking.display defaults to "omitted" on Claude Fable 5, Claude Mythos 5,
+// Opus 4.7/4.8, and Sonnet 5 (Opus 4.6/Sonnet 4.6 already defaulted to
+// "summarized") — with "omitted", the API still thinks but streams and
+// returns thinking blocks with an EMPTY text field, so a caller asking for
+// reasoning gets a real thinking block with nothing observable in it.
+// "summarized" is the only setting that produces visible text; Anthropic
+// never returns the raw chain of thought via this API on any model.
+//
+// Older models don't accept adaptive thinking at all, so they fall back to
+// the legacy thinking: {type: "enabled", budget_tokens: N} shape with a
+// fixed approximate budget per level (legacyThinkingBudgets), clamped to fit
+// under maxTokens (Anthropic requires budget_tokens < max_tokens) and
+// floored at the API's stated 1024 minimum. Display is not set there — it's
+// documented only in the context of the newer effort-capable models this
+// library treats as "adaptive," so there's no evidence it's a safe field to
+// send to genuinely old models.
+func thinkingForEffort(model string, effort llmapi.ReasoningEffort, maxTokens int) (*ThinkingConfig, *OutputConfig) {
 	if effort == llmapi.ReasoningOff {
+		if mustAlwaysThink(model) {
+			return &ThinkingConfig{Type: "adaptive", Display: "summarized"}, &OutputConfig{Effort: llmapi.ReasoningLow.String()}
+		}
+		if defaultsToAdaptiveThinking(model) {
+			return &ThinkingConfig{Type: "disabled"}, nil
+		}
 		return nil, nil
 	}
-	budget := 1024
-	switch effort {
-	case llmapi.ReasoningMedium:
-		budget = maxTokens / 4
-	case llmapi.ReasoningHigh:
-		budget = maxTokens / 2
-	case llmapi.ReasoningMax:
-		budget = maxTokens * 3 / 4
+	if supportsAdaptiveThinking(model) {
+		return &ThinkingConfig{Type: "adaptive", Display: "summarized"}, &OutputConfig{Effort: effort.String()}
+	}
+	budget := legacyThinkingBudgets[effort]
+	if budget >= maxTokens {
+		budget = maxTokens - 1
 	}
 	if budget < 1024 {
 		budget = 1024
-	}
-	if budget >= maxTokens {
-		return nil, fmt.Errorf("reasoning effort %s needs max_tokens > %d to fit a thinking budget under max_tokens, got max_tokens=%d", effort, budget, maxTokens)
 	}
 	return &ThinkingConfig{Type: "enabled", BudgetTokens: budget}, nil
 }
@@ -415,29 +497,30 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	// Note: The API doesn't support caching individual tools, only the entire tools array
 	// Tool caching is handled at the API level, not per-tool
 
+	// thinkingForEffort is resolved before sampling because resolveSampling
+	// must know whether thinking is active: Anthropic rejects any explicit
+	// temperature/top_p/top_k the moment thinking is on, regardless of model.
+	thinkingCfg, outputCfg := thinkingForEffort(c.Settings.Model, sampling.ReasoningEffort, c.Settings.MaxTokens)
+
 	// Resolve sampling parameters, layering per-call overrides over conversation
 	// defaults and dropping them entirely on models that no longer accept them
-	// (Claude Opus 4.7+; see supportsSampling).
-	temperature, topP, topK := resolveSampling(c.Settings, sampling)
-
-	thinkingCfg, thinkErr := thinkingForEffort(sampling.ReasoningEffort, c.Settings.MaxTokens)
-	if thinkErr != nil {
-		return nil, thinkErr
-	}
+	// (Claude Opus 4.7+; see supportsSampling) or whenever thinking is active.
+	temperature, topP, topK := resolveSampling(c.Settings, sampling, thinkingCfg.active())
 
 	// Apply conversation turn cache breakpoints before building the request
 	c.applyCacheBreakpoints()
 
 	messages := Messages{
-		Model:       c.Settings.Model,
-		MaxTokens:   c.Settings.MaxTokens,
-		Temperature: temperature,
-		TopP:        topP,
-		TopK:        topK,
-		System:      system,
-		Messages:    c.Messages,
-		Tools:       tools,
-		Thinking:    thinkingCfg,
+		Model:        c.Settings.Model,
+		MaxTokens:    c.Settings.MaxTokens,
+		Temperature:  temperature,
+		TopP:         topP,
+		TopK:         topK,
+		System:       system,
+		Messages:     c.Messages,
+		Tools:        tools,
+		Thinking:     thinkingCfg,
+		OutputConfig: outputCfg,
 	}
 
 	// Marshal messages to JSON
@@ -595,28 +678,30 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		}
 	}
 
-	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits them).
-	temperature, topP, topK := resolveSampling(c.Settings, sampling)
+	// thinkingForEffort is resolved before sampling because resolveSampling
+	// must know whether thinking is active: Anthropic rejects any explicit
+	// temperature/top_p/top_k the moment thinking is on, regardless of model.
+	thinkingCfg, outputCfg := thinkingForEffort(c.Settings.Model, sampling.ReasoningEffort, c.Settings.MaxTokens)
 
-	thinkingCfg, thinkErr := thinkingForEffort(sampling.ReasoningEffort, c.Settings.MaxTokens)
-	if thinkErr != nil {
-		return nil, thinkErr
-	}
+	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits
+	// them) or whenever thinking is active.
+	temperature, topP, topK := resolveSampling(c.Settings, sampling, thinkingCfg.active())
 
 	// Apply conversation turn cache breakpoints before building the request
 	c.applyCacheBreakpoints()
 
 	messages := Messages{
-		Model:       c.Settings.Model,
-		MaxTokens:   c.Settings.MaxTokens,
-		Temperature: temperature,
-		TopP:        topP,
-		TopK:        topK,
-		System:      system,
-		Messages:    c.Messages,
-		Tools:       c.Tools,
-		Thinking:    thinkingCfg,
-		Stream:      true,
+		Model:        c.Settings.Model,
+		MaxTokens:    c.Settings.MaxTokens,
+		Temperature:  temperature,
+		TopP:         topP,
+		TopK:         topK,
+		System:       system,
+		Messages:     c.Messages,
+		Tools:        c.Tools,
+		Thinking:     thinkingCfg,
+		OutputConfig: outputCfg,
+		Stream:       true,
 	}
 
 	jsonData, marshalErr := json.Marshal(messages)
@@ -683,13 +768,14 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 	}
 
 	// Parse SSE stream
-	reply, stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, err := c.parseSSEStreamRich(resp.Body, callback)
+	blocks, _, stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, err := c.parseSSEStreamRich(resp.Body, callback)
 	if err != nil {
 		return nil, err
 	}
 
-	// Add assistant message to history
-	c.AddMessage(llmapi.RoleAssistant, reply)
+	// Add assistant response to history — the real blocks (text, thinking
+	// with its Signature, etc.), not a flattened reply string.
+	c.addContentBlocksAsMessage(blocks)
 
 	// Update usage statistics
 	c.Usage.InputTokens += inputTokens
@@ -709,9 +795,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 	}
 
 	return &llmapi.RichResponse{
-		Content: []llmapi.ContentBlock{
-			llmapi.NewTextBlock(reply),
-		},
+		Content:                  fromAnthropicContentBlocks(blocks),
 		StopReason:               stopReason,
 		InputTokens:              inputTokens,
 		OutputTokens:             outputTokens,
@@ -796,28 +880,31 @@ func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (r
 		return "", "", 0, 0, 0, 0, err
 	}
 
-	// Extract text for adding to history
-	var responseText string
-	for i := range *response.Content {
-		if (*response.Content)[i].ContentType == "text" {
-			responseText = *(*response.Content)[i].Text
-		}
-	}
+	// History gets the full response verbatim — text, thinking (with its
+	// Signature), tool_use, everything — exactly as SendRich already does via
+	// addResponseAsMessage. Anthropic requires thinking blocks to be replayed
+	// back on later turns for correctness (interleaved thinking + tool use in
+	// particular); dropping them from history to keep the returned string
+	// clean would silently break that. Thinking is NOT ephemeral — it is
+	// captured here in full, not accumulated as a lossy side effect.
+	conversation.addResponseAsMessage(response)
 
-	// Add assistant response to history
-	conversation.AddMessage(llmapi.RoleAssistant, responseText)
-
-	// Build reply from text and thinking content blocks
+	// reply, by contrast, is content-only: this is what callers persist as
+	// generated content (e.g. :task/content) or feed back as a plain-text
+	// prompt. Merging a "<thinking>...</thinking>" marker into it — a shape
+	// Anthropic never sent — used to duplicate the same reasoning text into
+	// that content, corrupting it for every downstream consumer.
 	var hasThinking bool
 	for _, contentBlock := range *response.Content {
 		if os.Getenv("ANTHROPIC_DEBUG") == "true" {
 			fmt.Printf("DEBUG: Content block type: %s\n", contentBlock.ContentType)
 		}
-
-		if contentBlock.ContentType == "text" && contentBlock.Text != nil {
-			reply += *contentBlock.Text
-		} else if contentBlock.ContentType == "thinking" && contentBlock.Thinking != nil {
-			reply += "<thinking>\n" + *contentBlock.Thinking + "\n</thinking>\n"
+		switch contentBlock.ContentType {
+		case "text":
+			if contentBlock.Text != nil {
+				reply += *contentBlock.Text
+			}
+		case "thinking":
 			hasThinking = true
 		}
 	}
@@ -904,28 +991,30 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		}
 	}
 
-	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits them).
-	temperature, topP, topK := resolveSampling(conversation.Settings, sampling)
+	// thinkingForEffort is resolved before sampling because resolveSampling
+	// must know whether thinking is active: Anthropic rejects any explicit
+	// temperature/top_p/top_k the moment thinking is on, regardless of model.
+	thinkingCfg, outputCfg := thinkingForEffort(conversation.Settings.Model, sampling.ReasoningEffort, conversation.Settings.MaxTokens)
 
-	thinkingCfg, thinkErr := thinkingForEffort(sampling.ReasoningEffort, conversation.Settings.MaxTokens)
-	if thinkErr != nil {
-		return "", "", 0, 0, 0, 0, thinkErr
-	}
+	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits
+	// them) or whenever thinking is active.
+	temperature, topP, topK := resolveSampling(conversation.Settings, sampling, thinkingCfg.active())
 
 	// Apply conversation turn cache breakpoints before building the request
 	conversation.applyCacheBreakpoints()
 
 	messages := Messages{
-		Model:       conversation.Settings.Model,
-		MaxTokens:   conversation.Settings.MaxTokens,
-		Temperature: temperature,
-		TopP:        topP,
-		TopK:        topK,
-		System:      system,
-		Messages:    conversation.Messages,
-		Tools:       conversation.Tools,
-		Thinking:    thinkingCfg,
-		Stream:      true,
+		Model:        conversation.Settings.Model,
+		MaxTokens:    conversation.Settings.MaxTokens,
+		Temperature:  temperature,
+		TopP:         topP,
+		TopK:         topK,
+		System:       system,
+		Messages:     conversation.Messages,
+		Tools:        conversation.Tools,
+		Thinking:     thinkingCfg,
+		OutputConfig: outputCfg,
+		Stream:       true,
 	}
 
 	jsonData, marshalErr := json.Marshal(messages)
@@ -993,13 +1082,14 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 	}
 
 	// Parse SSE stream
-	reply, stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, err = conversation.parseSSEStreamRich(resp.Body, callback)
+	blocks, reply, stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, err := conversation.parseSSEStreamRich(resp.Body, callback)
 	if err != nil {
 		return reply, stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, err
 	}
 
-	// Add assistant message to history
-	conversation.AddMessage(llmapi.RoleAssistant, reply)
+	// Add assistant response to history — the real blocks (text, thinking
+	// with its Signature, etc.), not the flattened reply string.
+	conversation.addContentBlocksAsMessage(blocks)
 
 	// Update usage statistics
 	conversation.Usage.InputTokens += inputTokens
@@ -1038,6 +1128,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 //	event: message_stop
 //	data: {"type":"message_stop"}
 func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback llmapi.StreamCallback) (
+	blocks []ContentBlock,
 	fullText string,
 	stopReason string,
 	inputTokens int,
@@ -1048,8 +1139,12 @@ func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback ll
 ) {
 	scanner := bufio.NewScanner(body)
 	var currentBlockType string
-	var textBuilder strings.Builder
-	var thinkingBuilder strings.Builder
+	var currentToolID string
+	var currentToolName string
+	var currentText strings.Builder
+	var currentThinking strings.Builder
+	var currentSignature strings.Builder
+	var currentPartialJSON strings.Builder
 	var currentEvent string
 
 	for scanner.Scan() {
@@ -1084,32 +1179,75 @@ func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback ll
 			}
 
 		case "content_block_start":
-			// Track what type of block we're starting
+			// Track what type of block we're starting; reset its accumulators.
+			// Anthropic streams blocks sequentially (start, deltas, stop) so a
+			// single set of accumulators is enough — no need to key by index.
+			// A tool_use block's id/name arrive here, at block start; only its
+			// input streams incrementally via input_json_delta.
 			if event.Content != nil {
 				currentBlockType = event.Content.ContentType
+				currentToolID = derefString(event.Content.ID)
+				currentToolName = derefString(event.Content.Name)
 			}
+			currentText.Reset()
+			currentThinking.Reset()
+			currentSignature.Reset()
+			currentPartialJSON.Reset()
 
 		case "content_block_delta":
 			if event.Delta != nil {
 				switch event.Delta.Type {
 				case "text_delta":
-					textBuilder.WriteString(event.Delta.Text)
+					currentText.WriteString(event.Delta.Text)
 					if callback != nil {
 						callback(llmapi.StreamDelta{Text: event.Delta.Text, Kind: llmapi.TokenContent})
 					}
 				case "thinking_delta":
-					thinkingBuilder.WriteString(event.Delta.Thinking)
+					currentThinking.WriteString(event.Delta.Thinking)
 					// Stream thinking to the callback tagged as reasoning so consumers
 					// can route it separately from content.
 					if callback != nil && event.Delta.Thinking != "" {
 						callback(llmapi.StreamDelta{Text: event.Delta.Thinking, Kind: llmapi.TokenReasoning})
 					}
+				case "signature_delta":
+					currentSignature.WriteString(event.Delta.Signature)
+				case "input_json_delta":
+					currentPartialJSON.WriteString(event.Delta.PartialJSON)
 				}
 			}
 
 		case "content_block_stop":
-			// Block finished - could finalize here if needed
+			// Finalize the block that just closed into a real ContentBlock —
+			// the same shape a non-streaming response's Content carries, so
+			// history (built from these blocks) replays thinking blocks with
+			// their Signature exactly as Anthropic requires, and tool_use
+			// blocks with their id/name/input, instead of dropping either.
+			switch currentBlockType {
+			case "text":
+				text := currentText.String()
+				blocks = append(blocks, ContentBlock{ContentType: "text", Text: &text})
+			case "thinking":
+				thinking := currentThinking.String()
+				block := ContentBlock{ContentType: "thinking", Thinking: &thinking}
+				if sig := currentSignature.String(); sig != "" {
+					block.Signature = &sig
+				}
+				blocks = append(blocks, block)
+			case "tool_use":
+				// A tool with no input still gets an input_json_delta for "{}"
+				// in practice, but default defensively since Input must be
+				// valid JSON for downstream json.Unmarshal callers.
+				raw := json.RawMessage(currentPartialJSON.String())
+				if len(raw) == 0 {
+					raw = json.RawMessage("{}")
+				}
+				id := currentToolID
+				name := currentToolName
+				blocks = append(blocks, ContentBlock{ContentType: "tool_use", ID: &id, Name: &name, Input: &raw})
+			}
 			currentBlockType = ""
+			currentToolID = ""
+			currentToolName = ""
 
 		case "message_delta":
 			// Final event before message_stop - contains stop reason and output tokens
@@ -1128,24 +1266,31 @@ func (conversation *Conversation) parseSSEStreamRich(body io.Reader, callback ll
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return textBuilder.String(), stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, fmt.Errorf("error reading stream: %w", err)
+	// fullText is content-only, derived from the finalized blocks — never the
+	// mangled "<thinking>...</thinking>"-prefixed string this used to return.
+	// hasThinking still gets set on a read error below: thinking that
+	// streamed before the error is still real thinking that happened.
+	var textResult strings.Builder
+	var hasThinking bool
+	for _, b := range blocks {
+		switch b.ContentType {
+		case "text":
+			if b.Text != nil {
+				textResult.WriteString(*b.Text)
+			}
+		case "thinking":
+			hasThinking = true
+		}
 	}
-
-	// Build full text with thinking if present
-	var result strings.Builder
-	if thinkingBuilder.Len() > 0 {
-		result.WriteString("<thinking>\n")
-		result.WriteString(thinkingBuilder.String())
-		result.WriteString("\n</thinking>\n")
+	if hasThinking {
 		conversation.HasThinkingContent = true
 	}
-	result.WriteString(textBuilder.String())
 
-	// Suppress unused variable warning
-	_ = currentBlockType
+	if err := scanner.Err(); err != nil {
+		return blocks, textResult.String(), stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, fmt.Errorf("error reading stream: %w", err)
+	}
 
-	return result.String(), stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, nil
+	return blocks, textResult.String(), stopReason, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, nil
 }
 
 func (conversation *Conversation) SendUntilDone(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int, err error) {
@@ -1732,14 +1877,24 @@ func derefRawMessage(r *json.RawMessage) json.RawMessage {
 	return *r
 }
 
+// addContentBlocksAsMessage appends an assistant turn carrying the given
+// content blocks verbatim — text, thinking (with its Signature), tool_use,
+// everything — to conversation history. Shared by the non-streaming path
+// (addResponseAsMessage, from a full Response) and the streaming path (from
+// parseSSEStreamRich's finalized blocks), so thinking is preserved for replay
+// either way instead of being flattened into a lossy string.
+func (c *Conversation) addContentBlocksAsMessage(blocks []ContentBlock) {
+	msg := Message{
+		Role:    "assistant",
+		Content: &blocks,
+	}
+	*c.Messages = append(*c.Messages, &msg)
+}
+
 // addResponseAsMessage - Add response content blocks as assistant messages
 func (c *Conversation) addResponseAsMessage(response *Response) {
 	// Store ALL content blocks, not just text
-	msg := Message{
-		Role:    "assistant",
-		Content: response.Content, // keep tool_use, thinking, etc.
-	}
-	*c.Messages = append(*c.Messages, &msg)
+	c.addContentBlocksAsMessage(*response.Content)
 }
 
 // flattenResponseToString - flattens response to string for backwards compatability.
