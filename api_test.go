@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -644,6 +645,131 @@ func TestSendRich(t *testing.T) {
 	}
 }
 
+// TestSendRich_AdaptiveThinking_RealReasoning drives the adaptive-thinking
+// mapping (thinkingForEffort / supportsAdaptiveThinking) against the real API
+// with a prompt that actually requires multi-step reasoning to answer
+// correctly — a combined-rate word problem, not a greeting. A trivial prompt
+// like "Hello Claude!" gives the model nothing to reason about, so even with
+// thinking enabled it may return an empty or near-empty thinking block; the
+// prompt has to earn the reasoning it's meant to trigger.
+//
+// wbrown/openai cannot do this in its own test suite: its embedded test
+// backend (tinyoai) has no reasoning concept at all, so its reasoning tests
+// only check wire shape and SSE parsing against synthetic data (see
+// TestReasoningEffortChatTemplateKwargs / TestParseSSEStreamReasoningContent
+// in openai/api_test.go). This repo's tests already call the real API
+// elsewhere (TestConversation_Send, TestSendRich, etc.), so this test goes
+// further and verifies actual reasoning happened — a non-empty thinking block
+// via RichResponse.ThinkingText() — rather than only the request shape, which
+// reasoning_effort_test.go and thinking_gate_test.go already pin against a
+// stub server.
+func TestSendRich_AdaptiveThinking_RealReasoning(t *testing.T) {
+	conversation := NewConversation("You are a careful, precise assistant.")
+	if !supportsAdaptiveThinking(conversation.Settings.Model) {
+		t.Fatalf("test assumes DefaultSettings.Model (%q) supports adaptive thinking", conversation.Settings.Model)
+	}
+
+	content := []llmapi.ContentBlock{llmapi.NewTextBlock(
+		"A cistern can be filled by pipe A alone in 6 hours and by pipe B alone in " +
+			"8 hours. Pipe C, a drain, can empty a full cistern in 12 hours. Starting " +
+			"with an empty cistern, all three pipes are opened at once. Work through " +
+			"the combined fill rate step by step, then give the exact number of hours " +
+			"it takes to fill the cistern on its own final line, prefixed with 'ANSWER:'.",
+	)}
+
+	response, err := conversation.SendRich(content, llmapi.Sampling{ReasoningEffort: llmapi.ReasoningHigh})
+	if err != nil {
+		t.Fatalf("SendRich: %v", err)
+	}
+
+	thinking := response.ThinkingText()
+	if strings.TrimSpace(thinking) == "" {
+		t.Error("expected a non-empty thinking block for a multi-step reasoning prompt at ReasoningHigh")
+	}
+	t.Logf("thinking length: %d chars", len(thinking))
+
+	if strings.TrimSpace(response.Text()) == "" {
+		t.Error("expected a non-empty final answer")
+	}
+}
+
+// TestSendRichStreaming_ContinuesAfterSignedThinkingAndToolUse is the
+// decisive end-to-end proof for the history-fidelity fix: it doesn't just
+// parse a synthetic SSE fixture (TestParseSSEStreamRich_WithThinking /
+// _WithToolUse already pin that in isolation) — it drives two real,
+// consecutive API calls and lets Anthropic itself be the judge.
+//
+// Anthropic requires a thinking block to be replayed back verbatim —
+// including its Signature — on the next turn whenever it preceded a
+// tool_use in the same assistant message; the API can reject the
+// continuation outright if that block was stripped, modified, or replaced
+// with a lossy re-summarization. Before this fix, SendRichStreaming did
+// exactly that: it flattened thinking into a "<thinking>...</thinking>"
+// string (dropping the Signature entirely) and silently dropped tool_use
+// blocks from history altogether, so a conversation shaped like this one
+// could not correctly continue.
+//
+// Turn 1 forces a thinking-then-tool-call turn (system + user prompt both
+// push hard for it, since neither is guaranteed on any single sample).
+// Turn 2 supplies the tool result — a call that only succeeds if turn 1's
+// full content blocks, thinking block and signature included, made it into
+// conversation history unmodified.
+func TestSendRichStreaming_ContinuesAfterSignedThinkingAndToolUse(t *testing.T) {
+	conversation := NewConversation(
+		"You are a careful assistant. When asked about weather, think through " +
+			"which city the user means, then you MUST call the get_weather tool — " +
+			"never answer a weather question from your own knowledge.")
+	if !supportsAdaptiveThinking(conversation.Settings.Model) {
+		t.Fatalf("test assumes DefaultSettings.Model (%q) supports adaptive thinking", conversation.Settings.Model)
+	}
+	conversation.SetTools([]llmapi.ToolDefinition{{
+		Name:        "get_weather",
+		Description: "Get the current weather for a city. Call this for any weather question.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`),
+	}})
+
+	turn1 := []llmapi.ContentBlock{llmapi.NewTextBlock(
+		"Before calling any tool, briefly reason about which city I mean: " +
+			"'Boston' with no state, in a sentence that starts with a US city named " +
+			"Boston in Massachusetts. Then check the weather there.",
+	)}
+	response1, err := conversation.SendRichStreaming(turn1, llmapi.Sampling{ReasoningEffort: llmapi.ReasoningHigh}, nil)
+	if err != nil {
+		t.Fatalf("SendRichStreaming (turn 1): %v", err)
+	}
+
+	var sawSignedThinking bool
+	var toolUseID string
+	for _, block := range response1.Content {
+		if block.Type == llmapi.ContentTypeThinking && block.Thinking != nil && block.Thinking.Signature != "" {
+			sawSignedThinking = true
+		}
+		if block.Type == llmapi.ContentTypeToolUse && block.ToolUse != nil {
+			toolUseID = block.ToolUse.ID
+		}
+	}
+	if !sawSignedThinking {
+		t.Fatalf("turn 1: expected a signed thinking block, got %+v", response1.Content)
+	}
+	if toolUseID == "" {
+		t.Fatalf("turn 1: expected a tool_use block, got %+v", response1.Content)
+	}
+
+	// Turn 2: supply the tool result. If turn 1's thinking block (with its
+	// Signature) wasn't preserved verbatim in history, this is where
+	// Anthropic rejects the request.
+	turn2 := []llmapi.ContentBlock{
+		llmapi.NewToolResultBlock(toolUseID, "68F and sunny in Boston, MA", false),
+	}
+	response2, err := conversation.SendRichStreaming(turn2, llmapi.Sampling{ReasoningEffort: llmapi.ReasoningHigh}, nil)
+	if err != nil {
+		t.Fatalf("SendRichStreaming (turn 2, continuing after signed thinking + tool use): %v", err)
+	}
+	if strings.TrimSpace(response2.Text()) == "" {
+		t.Error("turn 2: expected a non-empty final answer after the tool result")
+	}
+}
+
 // TestAddRichMessage_GetRichMessages tests adding and retrieving rich messages.
 func TestAddRichMessage_GetRichMessages(t *testing.T) {
 	conversation := NewConversation("You are helpful.")
@@ -910,10 +1036,13 @@ data: {"type":"message_stop"}
 	}
 
 	reader := strings.NewReader(sseData)
-	fullText, stopReason, inputTokens, outputTokens, _, _, err := conv.parseSSEStreamRich(reader, callback)
+	blocks, fullText, stopReason, inputTokens, outputTokens, _, _, err := conv.parseSSEStreamRich(reader, callback)
 
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].ContentType != "text" || blocks[0].Text == nil || *blocks[0].Text != "Hello world!" {
+		t.Errorf("Expected blocks = [{text, \"Hello world!\"}], got %+v", blocks)
 	}
 	if fullText != "Hello world!" {
 		t.Errorf("Expected fullText 'Hello world!', got '%s'", fullText)
@@ -935,9 +1064,17 @@ data: {"type":"message_stop"}
 	}
 }
 
-// TestParseSSEStreamRich_WithThinking tests parsing SSE stream with thinking blocks.
+// TestParseSSEStreamRich_WithThinking tests parsing SSE stream with thinking
+// blocks. Pins the corrected contract: fullText (and, by extension, whatever
+// a caller persists as generated content) is content-only — no fabricated
+// "<thinking>...</thinking>" markup, which Anthropic never sends and which
+// used to duplicate the reasoning text into the content. The reasoning
+// itself is NOT discarded: it comes back as a real ContentTypeThinking-
+// equivalent block (ContentType "thinking") in blocks, with its Signature
+// (from signature_delta) preserved — the same shape addContentBlocksAsMessage
+// stores into conversation history for correct multi-turn replay.
 func TestParseSSEStreamRich_WithThinking(t *testing.T) {
-	// Mock SSE stream with thinking and text
+	// Mock SSE stream with thinking (incl. its verification signature) and text
 	sseData := `event: message_start
 data: {"type":"message_start","message":{"usage":{"input_tokens":50}}}
 
@@ -949,6 +1086,9 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" Done thinking."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc123"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
@@ -971,24 +1111,35 @@ data: {"type":"message_stop"}
 
 	conv := NewConversation("Test")
 	reader := strings.NewReader(sseData)
-	fullText, stopReason, inputTokens, outputTokens, _, _, err := conv.parseSSEStreamRich(reader, nil)
+	blocks, fullText, stopReason, inputTokens, outputTokens, _, _, err := conv.parseSSEStreamRich(reader, nil)
 
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	// Log the actual output for verification
-	t.Logf("Full text output:\n%s", fullText)
-
-	// Should contain thinking tags
-	expectedThinking := "<thinking>\nLet me think... Done thinking.\n</thinking>\n"
-	if !strings.Contains(fullText, expectedThinking) {
-		t.Errorf("Expected fullText to contain thinking block, got '%s'", fullText)
+	// fullText must be content-only: no "<thinking>" markup, exactly the
+	// visible answer.
+	if fullText != "The answer is 42." {
+		t.Errorf("fullText = %q, want %q (content-only, no thinking markup)", fullText, "The answer is 42.")
 	}
 
-	// Should contain text
-	if !strings.Contains(fullText, "The answer is 42.") {
-		t.Errorf("Expected fullText to contain 'The answer is 42.', got '%s'", fullText)
+	// The reasoning must still be present, as a real block — not dropped.
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks (thinking, text), got %d: %+v", len(blocks), blocks)
+	}
+	thinkingBlock := blocks[0]
+	if thinkingBlock.ContentType != "thinking" {
+		t.Fatalf("blocks[0].ContentType = %q, want \"thinking\"", thinkingBlock.ContentType)
+	}
+	if thinkingBlock.Thinking == nil || *thinkingBlock.Thinking != "Let me think... Done thinking." {
+		t.Errorf("blocks[0].Thinking = %v, want \"Let me think... Done thinking.\"", thinkingBlock.Thinking)
+	}
+	if thinkingBlock.Signature == nil || *thinkingBlock.Signature != "sig-abc123" {
+		t.Errorf("blocks[0].Signature = %v, want \"sig-abc123\" (from signature_delta)", thinkingBlock.Signature)
+	}
+	textBlock := blocks[1]
+	if textBlock.ContentType != "text" || textBlock.Text == nil || *textBlock.Text != "The answer is 42." {
+		t.Errorf("blocks[1] = %+v, want {text, \"The answer is 42.\"}", textBlock)
 	}
 
 	if stopReason != "end_turn" {
@@ -1004,6 +1155,81 @@ data: {"type":"message_stop"}
 	// Should set HasThinkingContent flag
 	if !conv.HasThinkingContent {
 		t.Error("Expected HasThinkingContent to be true")
+	}
+}
+
+// TestParseSSEStreamRich_WithToolUse pins tool_use block reconstruction: id
+// and name arrive at content_block_start, input streams incrementally via
+// input_json_delta and must be concatenated into valid JSON at
+// content_block_stop. Before this, tool_use blocks were silently dropped
+// entirely — SendRichStreaming had no way to surface a tool call to its
+// caller at all.
+func TestParseSSEStreamRich_WithToolUse(t *testing.T) {
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":40}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01abc","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\": \""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"Boston\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+
+	conv := NewConversation("Test")
+	reader := strings.NewReader(sseData)
+	blocks, fullText, stopReason, inputTokens, outputTokens, _, _, err := conv.parseSSEStreamRich(reader, nil)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if fullText != "" {
+		t.Errorf("fullText = %q, want \"\" (a tool_use turn has no text)", fullText)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block (tool_use), got %d: %+v", len(blocks), blocks)
+	}
+	block := blocks[0]
+	if block.ContentType != "tool_use" {
+		t.Fatalf("blocks[0].ContentType = %q, want \"tool_use\"", block.ContentType)
+	}
+	if block.ID == nil || *block.ID != "toolu_01abc" {
+		t.Errorf("blocks[0].ID = %v, want \"toolu_01abc\"", block.ID)
+	}
+	if block.Name == nil || *block.Name != "get_weather" {
+		t.Errorf("blocks[0].Name = %v, want \"get_weather\"", block.Name)
+	}
+	if block.Input == nil {
+		t.Fatal("blocks[0].Input is nil")
+	}
+	var input struct {
+		City string `json:"city"`
+	}
+	if err := json.Unmarshal(*block.Input, &input); err != nil {
+		t.Fatalf("blocks[0].Input is not valid JSON: %v (raw: %s)", err, *block.Input)
+	}
+	if input.City != "Boston" {
+		t.Errorf("input.city = %q, want \"Boston\" (input_json_delta fragments not concatenated correctly)", input.City)
+	}
+	if stopReason != "tool_use" {
+		t.Errorf("stopReason = %q, want \"tool_use\"", stopReason)
+	}
+	if inputTokens != 40 {
+		t.Errorf("inputTokens = %d, want 40", inputTokens)
+	}
+	if outputTokens != 20 {
+		t.Errorf("outputTokens = %d, want 20", outputTokens)
 	}
 }
 
@@ -1030,7 +1256,7 @@ data: {"type":"message_stop"}
 
 	conv := NewConversation("Test")
 	reader := strings.NewReader(sseData)
-	fullText, stopReason, _, _, _, _, err := conv.parseSSEStreamRich(reader, nil)
+	_, fullText, stopReason, _, _, _, _, err := conv.parseSSEStreamRich(reader, nil)
 
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
