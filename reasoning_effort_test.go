@@ -6,20 +6,25 @@ import (
 	"github.com/wbrown/llmapi"
 )
 
-// TestThinkingForEffort_LegacyModel pins the reasoning-effort mapping for
-// models that don't support adaptive thinking (see supportsAdaptiveThinking):
-// off => no thinking, no output_config; every other level gets its fixed
-// approximate budget from legacyThinkingBudgets, clamped to stay under
-// maxTokens and floored at the API's stated 1024 minimum.
-func TestThinkingForEffort_LegacyModel(t *testing.T) {
-	const model = "claude-sonnet-4-5" // pre-4.6: legacy budget-based thinking only
+// TestResolveThinkingBudget_LegacyModel pins the mapping for models that only
+// accept the legacy thinking: {type: "enabled", budget_tokens: N} shape (see
+// supportsAdaptiveThinking): off => no thinking and the wire max_tokens is
+// exactly the desired output; every other level gets its fixed approximate
+// budget from legacyThinkingBudgets, and the wire max_tokens is desired +
+// budget — the budget IS the reasoning headroom on these models, since
+// thinking and output share the request pool — clamped to the model's output
+// ceiling.
+func TestResolveThinkingBudget_LegacyModel(t *testing.T) {
+	const model = "claude-sonnet-4-5" // pre-4.6: legacy budget-based thinking; ceiling 64000
 
-	if cfg, outCfg := thinkingForEffort(model, llmapi.ReasoningOff, 8192); cfg != nil || outCfg != nil {
+	cfg, outCfg, wire := resolveThinkingBudget(model, llmapi.ReasoningOff, 8192)
+	if cfg != nil || outCfg != nil {
 		t.Errorf("off: got thinking=%v output_config=%v, want nil,nil", cfg, outCfg)
 	}
+	if wire != 8192 {
+		t.Errorf("off: wire = %d, want 8192 (desired, no headroom)", wire)
+	}
 
-	// No clamping needed: legacyThinkingBudgets values all fit comfortably
-	// under maxTokens=32768.
 	scaled := []struct {
 		effort     llmapi.ReasoningEffort
 		wantBudget int
@@ -27,125 +32,154 @@ func TestThinkingForEffort_LegacyModel(t *testing.T) {
 		{llmapi.ReasoningLow, 1024},
 		{llmapi.ReasoningMedium, 4096},
 		{llmapi.ReasoningHigh, 8192},
+		{llmapi.ReasoningXHigh, 16384}, // legacy models predate the tier; = max
 		{llmapi.ReasoningMax, 16384},
 	}
 	for _, tc := range scaled {
-		cfg, outCfg := thinkingForEffort(model, tc.effort, 32768)
+		cfg, outCfg, wire := resolveThinkingBudget(model, tc.effort, 8192)
 		if cfg == nil || cfg.Type != "enabled" || cfg.BudgetTokens != tc.wantBudget {
 			t.Errorf("%v: got thinking=%+v, want {Type:enabled BudgetTokens:%d}", tc.effort, cfg, tc.wantBudget)
 		}
 		if outCfg != nil {
 			t.Errorf("%v: got output_config=%+v, want nil on a legacy model", tc.effort, outCfg)
 		}
+		if want := 8192 + tc.wantBudget; wire != want {
+			t.Errorf("%v: wire = %d, want %d (desired + budget)", tc.effort, wire, want)
+		}
 	}
 
-	// A maxTokens smaller than the level's approximate budget clamps down
-	// to fit under it, rather than erroring.
-	if cfg, _ := thinkingForEffort(model, llmapi.ReasoningMax, 2048); cfg == nil || cfg.BudgetTokens != 2047 {
-		t.Errorf("max @ maxTokens=2048: got %+v, want BudgetTokens=2047 (maxTokens-1)", cfg)
-	}
-
-	// The 1024 floor can still exceed maxTokens when maxTokens itself is
-	// below the API's minimum — that's a genuinely invalid request (Anthropic
-	// requires budget_tokens < max_tokens), and this library no longer
-	// pre-validates that case (see thinkingForEffort's doc comment); it
-	// surfaces as a real 400 from the API rather than a Go-level error.
-	if cfg, _ := thinkingForEffort(model, llmapi.ReasoningLow, 1024); cfg == nil || cfg.BudgetTokens != 1024 {
-		t.Errorf("low @ maxTokens=1024: got %+v, want BudgetTokens=1024 (floor wins over the clamp)", cfg)
+	// The ceiling clamps the wire total; the budget stays intact beneath it
+	// (every legacy budget is far below every known ceiling, so the API's
+	// budget_tokens < max_tokens invariant holds by construction).
+	if _, _, wire := resolveThinkingBudget(model, llmapi.ReasoningMax, 60000); wire != 64000 {
+		t.Errorf("max @ desired=60000: wire = %d, want 64000 (ceiling clamp)", wire)
 	}
 }
 
-// thinkingForEffortNonOffCases is shared by both adaptive-model tests below:
-// regardless of whether ReasoningOff also happens to think (mustAlwaysThink),
-// every explicit non-off level maps to thinking: {type: "adaptive",
-// display: "summarized"} with output_config.effort set to the level's own
-// wire value (llmapi.ReasoningEffort.String() already returns
-// "low"/"medium"/"high"/"max" — Anthropic's own effort vocabulary — so no
-// translation is needed).
-func thinkingForEffortNonOffCases(t *testing.T, model string) {
-	t.Helper()
-	cases := []struct {
-		effort     llmapi.ReasoningEffort
-		wantEffort string
-	}{
-		{llmapi.ReasoningLow, "low"},
-		{llmapi.ReasoningMedium, "medium"},
-		{llmapi.ReasoningHigh, "high"},
-		{llmapi.ReasoningMax, "max"},
+// TestResolveThinkingBudget_AdaptiveModel pins the adaptive path: thinking
+// {type: adaptive, display: summarized} + output_config.effort, with the wire
+// max_tokens = desired + the effort tier's reasoning headroom (adaptive
+// thinking shares the request pool with the output), clamped to the model's
+// output ceiling. Off omits thinking entirely and reserves nothing.
+func TestResolveThinkingBudget_AdaptiveModel(t *testing.T) {
+	const model = "claude-opus-4-8" // adaptive; ceiling 128000
+
+	cfg, outCfg, wire := resolveThinkingBudget(model, llmapi.ReasoningOff, 8192)
+	if cfg != nil || outCfg != nil {
+		t.Errorf("off: got thinking=%v output_config=%v, want nil,nil", cfg, outCfg)
 	}
-	for _, tc := range cases {
-		cfg, outCfg := thinkingForEffort(model, tc.effort, 8192)
+	if wire != 8192 {
+		t.Errorf("off: wire = %d, want 8192 (desired, no headroom)", wire)
+	}
+
+	headrooms := []struct {
+		effort       llmapi.ReasoningEffort
+		wantEffort   string
+		wantHeadroom int
+	}{
+		{llmapi.ReasoningLow, "low", 4096},
+		{llmapi.ReasoningMedium, "medium", 8192},
+		{llmapi.ReasoningHigh, "high", 16384},
+		{llmapi.ReasoningXHigh, "xhigh", 65536},
+		{llmapi.ReasoningMax, "max", 65536},
+	}
+	for _, tc := range headrooms {
+		cfg, outCfg, wire := resolveThinkingBudget(model, tc.effort, 8192)
 		if cfg == nil || cfg.Type != "adaptive" || cfg.BudgetTokens != 0 || cfg.Display != "summarized" {
 			t.Errorf("%v: got thinking=%+v, want {Type:adaptive BudgetTokens:0 Display:summarized}", tc.effort, cfg)
 		}
 		if outCfg == nil || outCfg.Effort != tc.wantEffort {
 			t.Errorf("%v: got output_config=%+v, want effort=%q", tc.effort, outCfg, tc.wantEffort)
 		}
+		if want := 8192 + tc.wantHeadroom; wire != want {
+			t.Errorf("%v: wire = %d, want %d (desired + headroom)", tc.effort, wire, want)
+		}
+	}
+
+	// Ceiling clamp: a large desired at max effort cannot push the wire total
+	// past the model's real output ceiling.
+	if _, _, wire := resolveThinkingBudget(model, llmapi.ReasoningMax, 100000); wire != 128000 {
+		t.Errorf("max @ desired=100000: wire = %d, want 128000 (ceiling clamp)", wire)
 	}
 }
 
-// TestThinkingForEffort_AdaptiveModel pins the reasoning-effort mapping for
-// adaptive-thinking models where omitting the thinking field genuinely turns
-// thinking off (Opus 4.6-4.8 and Sonnet 4.6 run without thinking when the
-// request carries no thinking field): off => no thinking, no output_config.
-func TestThinkingForEffort_AdaptiveModel(t *testing.T) {
-	models := []string{
-		"claude-opus-4-8",
-		"claude-opus-4-7",
-		"claude-opus-4-6",
-		"claude-sonnet-4-6",
-	}
-
-	for _, model := range models {
-		t.Run(model, func(t *testing.T) {
-			if cfg, outCfg := thinkingForEffort(model, llmapi.ReasoningOff, 8192); cfg != nil || outCfg != nil {
-				t.Errorf("off: got thinking=%v output_config=%v, want nil,nil", cfg, outCfg)
-			}
-			thinkingForEffortNonOffCases(t, model)
-		})
-	}
-}
-
-// TestThinkingForEffort_AdaptiveDefaultModel pins the mapping for models where
-// OMITTING the thinking field runs adaptive thinking by default (Claude Sonnet
-// 5 — unlike Opus 4.7/4.8, whose omission-default is off). ReasoningOff must
-// therefore send an explicit thinking: {type: "disabled"} — omitting the field
-// would silently run adaptive thinking: billed, slow, and invisible (no
-// display parameter is sent, so the reasoning streams as empty-text deltas).
-// Non-off levels behave identically to any other adaptive-thinking model.
-func TestThinkingForEffort_AdaptiveDefaultModel(t *testing.T) {
+// TestResolveThinkingBudget_AdaptiveDefaultModel pins the Sonnet 5 shape:
+// off sends an explicit thinking: {type: "disabled"} (omission would run
+// adaptive thinking) and reserves no headroom; non-off levels behave like any
+// other adaptive model.
+func TestResolveThinkingBudget_AdaptiveDefaultModel(t *testing.T) {
 	const model = "claude-sonnet-5"
 
-	cfg, outCfg := thinkingForEffort(model, llmapi.ReasoningOff, 8192)
+	cfg, outCfg, wire := resolveThinkingBudget(model, llmapi.ReasoningOff, 8192)
 	if cfg == nil || cfg.Type != "disabled" || cfg.BudgetTokens != 0 || cfg.Display != "" {
-		t.Errorf("off: got thinking=%+v, want {Type:disabled} (omission runs adaptive by default on this model)", cfg)
+		t.Errorf("off: got thinking=%+v, want {Type:disabled}", cfg)
 	}
 	if outCfg != nil {
-		t.Errorf("off: got output_config=%+v, want nil (no effort when thinking is disabled)", outCfg)
+		t.Errorf("off: got output_config=%+v, want nil", outCfg)
 	}
-	thinkingForEffortNonOffCases(t, model)
+	if wire != 8192 {
+		t.Errorf("off: wire = %d, want 8192 (disabled thinking reserves nothing)", wire)
+	}
+
+	cfg, outCfg, wire = resolveThinkingBudget(model, llmapi.ReasoningHigh, 8192)
+	if cfg == nil || cfg.Type != "adaptive" || outCfg == nil || outCfg.Effort != "high" || wire != 24576 {
+		t.Errorf("high: got thinking=%+v output_config=%+v wire=%d, want adaptive/high/24576", cfg, outCfg, wire)
+	}
 }
 
-// TestThinkingForEffort_AlwaysThinkingModel pins the mustAlwaysThink branch:
-// Claude Fable 5 and Claude Mythos 5 think unconditionally, so even
-// ReasoningOff must still request display: "summarized" — otherwise the
-// unavoidable, billed reasoning comes back as empty-text thinking blocks
-// with zero visibility. Off requests the lowest effort, since the caller
-// didn't ask for reasoning at all; non-off levels behave identically to any
-// other adaptive-thinking model.
-func TestThinkingForEffort_AlwaysThinkingModel(t *testing.T) {
-	models := []string{"claude-fable-5", "claude-mythos-5"}
-
-	for _, model := range models {
+// TestResolveThinkingBudget_AlwaysThinkingModel pins the Fable/Mythos shape:
+// those models cannot stop thinking, so caller-off resolves to adaptive at
+// effort low with summarized display — and the wire budget reserves
+// headroom(low) for it, because that thinking is real and shares the output
+// pool. Keying headroom on the caller's "off" instead of the effective mode
+// would let the unavoidable reasoning eat the content budget.
+func TestResolveThinkingBudget_AlwaysThinkingModel(t *testing.T) {
+	for _, model := range []string{"claude-fable-5", "claude-mythos-5"} {
 		t.Run(model, func(t *testing.T) {
-			cfg, outCfg := thinkingForEffort(model, llmapi.ReasoningOff, 8192)
-			if cfg == nil || cfg.Type != "adaptive" || cfg.BudgetTokens != 0 || cfg.Display != "summarized" {
-				t.Errorf("off: got thinking=%+v, want {Type:adaptive BudgetTokens:0 Display:summarized}", cfg)
+			cfg, outCfg, wire := resolveThinkingBudget(model, llmapi.ReasoningOff, 8192)
+			if cfg == nil || cfg.Type != "adaptive" || cfg.Display != "summarized" {
+				t.Errorf("off: got thinking=%+v, want {Type:adaptive Display:summarized}", cfg)
 			}
 			if outCfg == nil || outCfg.Effort != "low" {
 				t.Errorf("off: got output_config=%+v, want effort=\"low\"", outCfg)
 			}
-			thinkingForEffortNonOffCases(t, model)
+			if wire != 8192+4096 {
+				t.Errorf("off: wire = %d, want 12288 (desired + headroom(low) for the unavoidable thinking)", wire)
+			}
+
+			_, outCfg, wire = resolveThinkingBudget(model, llmapi.ReasoningMax, 8192)
+			if outCfg == nil || outCfg.Effort != "max" || wire != 8192+65536 {
+				t.Errorf("max: got output_config=%+v wire=%d, want max/73728", outCfg, wire)
+			}
 		})
+	}
+}
+
+// TestResolveThinkingBudget_UnknownModelNoClamp pins the conservative default
+// for a model this library cannot vouch for: legacy thinking shape (per
+// supportsAdaptiveThinking's unrecognized-model behavior) and no known
+// ceiling — the wire total is desired + budget, unclamped, preserving the
+// pre-existing behavior for unknown IDs.
+func TestResolveThinkingBudget_UnknownModelNoClamp(t *testing.T) {
+	cfg, _, wire := resolveThinkingBudget("claude-future-model-xyz", llmapi.ReasoningHigh, 200000)
+	if cfg == nil || cfg.Type != "enabled" || cfg.BudgetTokens != 8192 {
+		t.Errorf("got thinking=%+v, want {Type:enabled BudgetTokens:8192}", cfg)
+	}
+	if wire != 208192 {
+		t.Errorf("wire = %d, want 208192 (desired + budget, no clamp without a known ceiling)", wire)
+	}
+}
+
+// TestResolveThinkingBudget_SmallCeilingModel pins the smallest known ceiling
+// (Opus 4.1, 32000): it caps the wire total while the legacy budget beneath
+// it stays valid — budget_tokens < max_tokens holds by construction, since
+// the largest legacy budget (16384) is below the smallest known ceiling.
+func TestResolveThinkingBudget_SmallCeilingModel(t *testing.T) {
+	cfg, _, wire := resolveThinkingBudget("claude-opus-4-1", llmapi.ReasoningMax, 32768)
+	if wire != 32000 {
+		t.Errorf("wire = %d, want 32000 (ceiling clamp)", wire)
+	}
+	if cfg == nil || cfg.BudgetTokens != 16384 {
+		t.Errorf("thinking = %+v, want BudgetTokens=16384 intact beneath the clamped wire", cfg)
 	}
 }

@@ -248,6 +248,57 @@ func TestDefaultsToAdaptiveThinking(t *testing.T) {
 	}
 }
 
+// TestModelOutputCeiling locks in each model generation's real per-request
+// output ceiling, per Anthropic's models overview (synchronous Messages API):
+// 128000 for every 4.6+ model (Fable/Mythos 5, Opus 4.6-4.8, Sonnet 4.6,
+// Sonnet 5), 64000 for the 4.5 tier (Sonnet 4.5, Opus 4.5, Haiku 4.5), 32000
+// for Opus 4.1. Generations older than that are retired at the API, and
+// unrecognized IDs are unknown — both report 0, meaning "no ceiling known, do
+// not clamp", which preserves this library's pre-existing behavior for
+// models it cannot vouch for.
+func TestModelOutputCeiling(t *testing.T) {
+	cases := []struct {
+		model string
+		want  int
+	}{
+		// 4.6+ (including all major-5 families): 128000
+		{"claude-fable-5", 128000},
+		{"claude-mythos-5", 128000},
+		{"claude-sonnet-5", 128000},
+		{"claude-opus-4-8", 128000},
+		{"claude-opus-4-7", 128000},
+		{"claude-opus-4-6", 128000},
+		{"claude-sonnet-4-6", 128000},
+
+		// 4.5 tier: 64000
+		{"claude-sonnet-4-5", 64000},
+		{"claude-opus-4-5", 64000},
+		{"claude-haiku-4-5", 64000},
+		{"claude-haiku-4-5-20251001", 64000},
+
+		// 4.1: 32000
+		{"claude-opus-4-1", 32000},
+
+		// Retired generations and unrecognized IDs: unknown → no clamp.
+		{"claude-opus-4-0", 0},
+		{"claude-3-7-sonnet-20250219", 0},
+		{"claude-3-5-sonnet-20241022", 0},
+		{"claude-3-opus-20240229", 0},
+		{"claude-2.1", 0},
+		{"", 0},
+		{"gpt-4", 0},
+		{"claude-future-model-xyz", 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := modelOutputCeiling(tc.model); got != tc.want {
+				t.Errorf("modelOutputCeiling(%q) = %d, want %d", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestResolveSampling_UnsupportedModelOmitsAll verifies that on an unsupported
 // model all three sampling params are zeroed (Temperature returns nil so the
 // pointer omits the field; TopP and TopK return 0 so omitempty drops them).

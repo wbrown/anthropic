@@ -155,6 +155,33 @@ func defaultsToAdaptiveThinking(model string) bool {
 	return ok && major >= 5
 }
 
+// modelOutputCeiling reports the model's real per-request output ceiling on
+// the synchronous Messages API, per Anthropic's models overview: 128000 for
+// every 4.6+ model (Fable/Mythos 5, Opus 4.6-4.8, Sonnet 4.6, Sonnet 5),
+// 64000 for the 4.5 tier (Sonnet 4.5, Opus 4.5, Haiku 4.5), 32000 for Opus
+// 4.1. Generations older than 4.1 are retired at the API, and unrecognized
+// IDs are unknown — both report 0, meaning "no ceiling known, do not clamp",
+// which preserves this library's pre-existing behavior for models it cannot
+// vouch for.
+//
+// See https://platform.claude.com/docs/en/about-claude/models/overview
+func modelOutputCeiling(model string) int {
+	major, minor, ok := parseModelVersion(model)
+	if !ok {
+		return 0
+	}
+	switch {
+	case major > 4 || (major == 4 && minor >= 6):
+		return 128000
+	case major == 4 && minor == 5:
+		return 64000
+	case major == 4 && minor == 1:
+		return 32000
+	default:
+		return 0
+	}
+}
+
 // resolveSampling computes the effective sampling parameters for a request.
 // It layers per-call overrides over conversation defaults, then gates the
 // result by two independent constraints, either of which omits all three

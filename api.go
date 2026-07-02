@@ -222,7 +222,11 @@ type SampleSettings struct {
 	Version string `json:"version"`
 	// Beta is the beta version of the model to use for the sample.
 	Beta string `json:"beta"`
-	// MaxTokens is the max number of tokens to generate.
+	// MaxTokens is the default DESIRED OUTPUT for calls that don't specify
+	// llmapi.Sampling.DesiredOutputTokens — how much real content a call
+	// wants, not the wire max_tokens. The wire value is computed per call by
+	// resolveThinkingBudget: desired plus the effective thinking mode's
+	// reasoning headroom, clamped to the model's real output ceiling.
 	MaxTokens int `json:"max_tokens"`
 	// Temperature to use for sampling (0.0-1.0).
 	Temperature float64 `json:"temperature"`
@@ -273,36 +277,62 @@ var legacyThinkingBudgets = map[llmapi.ReasoningEffort]int{
 	llmapi.ReasoningLow:    1024,
 	llmapi.ReasoningMedium: 4096,
 	llmapi.ReasoningHigh:   8192,
+	llmapi.ReasoningXHigh:  16384, // legacy models predate the tier; = max
 	llmapi.ReasoningMax:    16384,
 }
 
-// thinkingForEffort maps a requested reasoning effort to Claude's thinking
-// (and, on models that require it, output_config.effort) request fields.
+// adaptiveThinkingHeadroom is the per-effort reasoning reserve added to the
+// desired output when computing the wire max_tokens on adaptive-thinking
+// models: adaptive mode has no separate thinking budget — thinking and final
+// output share the one request-level max_tokens pool, so without a reserve
+// the model's reasoning eats the content budget and the output truncates.
+// The top tiers carry Anthropic's documented floor (at effort xhigh or max,
+// max_tokens must be >= 64000 or output truncates mid-thought); the lower
+// tiers halve from there.
+var adaptiveThinkingHeadroom = map[llmapi.ReasoningEffort]int{
+	llmapi.ReasoningLow:    4096,
+	llmapi.ReasoningMedium: 8192,
+	llmapi.ReasoningHigh:   16384,
+	llmapi.ReasoningXHigh:  65536,
+	llmapi.ReasoningMax:    65536,
+}
+
+// resolveThinkingBudget maps a requested reasoning effort and desired output
+// size to Claude's request fields: the thinking config, the output_config
+// (on models that take effort there), and the wire max_tokens.
 //
-// ReasoningOff omits thinking entirely on every model EXCEPT two groups whose
-// omission-default is not "off":
+// desired is how many tokens of real content the call wants — task intent,
+// not the wire cap. The wire max_tokens is desired plus the reasoning
+// headroom of the EFFECTIVE thinking mode (which may differ from the caller's
+// requested effort — see the off cases below), clamped to the model's real
+// output ceiling (modelOutputCeiling; unknown ceilings don't clamp). Headroom
+// keys on the effective mode so that a model whose thinking cannot be turned
+// off still gets its reasoning reserved instead of eating the content budget.
+//
+// ReasoningOff omits thinking entirely — and reserves no headroom — on every
+// model EXCEPT two groups whose omission-default is not "off":
 //
 //   - The mustAlwaysThink family (Claude Fable 5, Claude Mythos 5) thinks
 //     unconditionally regardless of what's sent, so omitting the field doesn't
 //     save anything — it only forfeits visibility, since thinking.display then
 //     defaults to "omitted" (real, billed reasoning comes back as empty-text
 //     blocks). For those models, ReasoningOff still requests display:
-//     "summarized" at the lowest effort level: the caller didn't ask for
-//     reasoning, so don't spend more on it than necessary, but don't let
-//     unavoidable reasoning go unrecorded either.
+//     "summarized" at the lowest effort level — with headroom(low) reserved,
+//     because that thinking is real and shares the output pool.
 //
 //   - The defaultsToAdaptiveThinking family (Claude Sonnet 5) runs adaptive
 //     thinking whenever the field is omitted — billed, slow, and invisible
 //     (no display parameter accompanies an omitted field). Unlike Fable/
 //     Mythos it CAN be turned off, so ReasoningOff sends an explicit
-//     thinking: {type: "disabled"}.
+//     thinking: {type: "disabled"} and reserves nothing.
 //
 // Any other level turns thinking on: on models that support adaptive
 // thinking (see supportsAdaptiveThinking), that means thinking: {type:
 // "adaptive"} paired with output_config.effort set to the requested level
-// directly — Anthropic's low/medium/high/max effort levels are the same
-// four llmapi.ReasoningEffort exposes, so no translation table is needed
-// beyond effort.String().
+// directly — Anthropic's low/medium/high/xhigh/max effort levels are the
+// same ones llmapi.ReasoningEffort exposes, so no translation table is
+// needed beyond effort.String() — with the tier's adaptiveThinkingHeadroom
+// reserved.
 //
 // Display is forced to "summarized" on the adaptive path. Anthropic's
 // thinking.display defaults to "omitted" on Claude Fable 5, Claude Mythos 5,
@@ -315,33 +345,43 @@ var legacyThinkingBudgets = map[llmapi.ReasoningEffort]int{
 //
 // Older models don't accept adaptive thinking at all, so they fall back to
 // the legacy thinking: {type: "enabled", budget_tokens: N} shape with a
-// fixed approximate budget per level (legacyThinkingBudgets), clamped to fit
-// under maxTokens (Anthropic requires budget_tokens < max_tokens) and
-// floored at the API's stated 1024 minimum. Display is not set there — it's
-// documented only in the context of the newer effort-capable models this
-// library treats as "adaptive," so there's no evidence it's a safe field to
-// send to genuinely old models.
-func thinkingForEffort(model string, effort llmapi.ReasoningEffort, maxTokens int) (*ThinkingConfig, *OutputConfig) {
-	if effort == llmapi.ReasoningOff {
-		if mustAlwaysThink(model) {
-			return &ThinkingConfig{Type: "adaptive", Display: "summarized"}, &OutputConfig{Effort: llmapi.ReasoningLow.String()}
-		}
-		if defaultsToAdaptiveThinking(model) {
-			return &ThinkingConfig{Type: "disabled"}, nil
-		}
-		return nil, nil
+// fixed approximate budget per level (legacyThinkingBudgets). There the
+// budget IS the headroom, so wire = desired + budget and the API's
+// budget_tokens < max_tokens invariant holds by construction: the largest
+// legacy budget (16384) is below the smallest known ceiling (32000), and an
+// unclamped wire always exceeds the budget by the desired amount. Display is
+// not set there — it's documented only in the context of the newer
+// effort-capable models this library treats as "adaptive," so there's no
+// evidence it's a safe field to send to genuinely old models.
+func resolveThinkingBudget(model string, effort llmapi.ReasoningEffort, desired int) (*ThinkingConfig, *OutputConfig, int) {
+	var thinking *ThinkingConfig
+	var output *OutputConfig
+	headroom := 0
+
+	switch {
+	case effort == llmapi.ReasoningOff && mustAlwaysThink(model):
+		thinking = &ThinkingConfig{Type: "adaptive", Display: "summarized"}
+		output = &OutputConfig{Effort: llmapi.ReasoningLow.String()}
+		headroom = adaptiveThinkingHeadroom[llmapi.ReasoningLow]
+	case effort == llmapi.ReasoningOff && defaultsToAdaptiveThinking(model):
+		thinking = &ThinkingConfig{Type: "disabled"}
+	case effort == llmapi.ReasoningOff:
+		// Omitting the field genuinely turns thinking off on every other model.
+	case supportsAdaptiveThinking(model):
+		thinking = &ThinkingConfig{Type: "adaptive", Display: "summarized"}
+		output = &OutputConfig{Effort: effort.String()}
+		headroom = adaptiveThinkingHeadroom[effort]
+	default:
+		budget := legacyThinkingBudgets[effort]
+		thinking = &ThinkingConfig{Type: "enabled", BudgetTokens: budget}
+		headroom = budget
 	}
-	if supportsAdaptiveThinking(model) {
-		return &ThinkingConfig{Type: "adaptive", Display: "summarized"}, &OutputConfig{Effort: effort.String()}
+
+	wire := desired + headroom
+	if ceiling := modelOutputCeiling(model); ceiling > 0 && wire > ceiling {
+		wire = ceiling
 	}
-	budget := legacyThinkingBudgets[effort]
-	if budget >= maxTokens {
-		budget = maxTokens - 1
-	}
-	if budget < 1024 {
-		budget = 1024
-	}
-	return &ThinkingConfig{Type: "enabled", BudgetTokens: budget}, nil
+	return thinking, output, wire
 }
 
 // A Conversation is a sequence of messages between a user and an assistant.
@@ -497,10 +537,17 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	// Note: The API doesn't support caching individual tools, only the entire tools array
 	// Tool caching is handled at the API level, not per-tool
 
-	// thinkingForEffort is resolved before sampling because resolveSampling
+	// resolveThinkingBudget is resolved before sampling because resolveSampling
 	// must know whether thinking is active: Anthropic rejects any explicit
 	// temperature/top_p/top_k the moment thinking is on, regardless of model.
-	thinkingCfg, outputCfg := thinkingForEffort(c.Settings.Model, sampling.ReasoningEffort, c.Settings.MaxTokens)
+	// desired is the per-call output intent, defaulting to Settings.MaxTokens
+	// (the conversation's default desired output); the wire max_tokens adds the
+	// effective thinking mode's reasoning headroom on top.
+	desired := sampling.DesiredOutputTokens
+	if desired == 0 {
+		desired = c.Settings.MaxTokens
+	}
+	thinkingCfg, outputCfg, maxTokens := resolveThinkingBudget(c.Settings.Model, sampling.ReasoningEffort, desired)
 
 	// Resolve sampling parameters, layering per-call overrides over conversation
 	// defaults and dropping them entirely on models that no longer accept them
@@ -512,7 +559,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 
 	messages := Messages{
 		Model:        c.Settings.Model,
-		MaxTokens:    c.Settings.MaxTokens,
+		MaxTokens:    maxTokens,
 		Temperature:  temperature,
 		TopP:         topP,
 		TopK:         topK,
@@ -678,10 +725,17 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		}
 	}
 
-	// thinkingForEffort is resolved before sampling because resolveSampling
+	// resolveThinkingBudget is resolved before sampling because resolveSampling
 	// must know whether thinking is active: Anthropic rejects any explicit
 	// temperature/top_p/top_k the moment thinking is on, regardless of model.
-	thinkingCfg, outputCfg := thinkingForEffort(c.Settings.Model, sampling.ReasoningEffort, c.Settings.MaxTokens)
+	// desired is the per-call output intent, defaulting to Settings.MaxTokens
+	// (the conversation's default desired output); the wire max_tokens adds the
+	// effective thinking mode's reasoning headroom on top.
+	desired := sampling.DesiredOutputTokens
+	if desired == 0 {
+		desired = c.Settings.MaxTokens
+	}
+	thinkingCfg, outputCfg, maxTokens := resolveThinkingBudget(c.Settings.Model, sampling.ReasoningEffort, desired)
 
 	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits
 	// them) or whenever thinking is active.
@@ -692,7 +746,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 
 	messages := Messages{
 		Model:        c.Settings.Model,
-		MaxTokens:    c.Settings.MaxTokens,
+		MaxTokens:    maxTokens,
 		Temperature:  temperature,
 		TopP:         topP,
 		TopK:         topK,
@@ -991,10 +1045,17 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		}
 	}
 
-	// thinkingForEffort is resolved before sampling because resolveSampling
+	// resolveThinkingBudget is resolved before sampling because resolveSampling
 	// must know whether thinking is active: Anthropic rejects any explicit
 	// temperature/top_p/top_k the moment thinking is on, regardless of model.
-	thinkingCfg, outputCfg := thinkingForEffort(conversation.Settings.Model, sampling.ReasoningEffort, conversation.Settings.MaxTokens)
+	// desired is the per-call output intent, defaulting to Settings.MaxTokens
+	// (the conversation's default desired output); the wire max_tokens adds the
+	// effective thinking mode's reasoning headroom on top.
+	desired := sampling.DesiredOutputTokens
+	if desired == 0 {
+		desired = conversation.Settings.MaxTokens
+	}
+	thinkingCfg, outputCfg, maxTokens := resolveThinkingBudget(conversation.Settings.Model, sampling.ReasoningEffort, desired)
 
 	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits
 	// them) or whenever thinking is active.
@@ -1005,7 +1066,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 
 	messages := Messages{
 		Model:        conversation.Settings.Model,
-		MaxTokens:    conversation.Settings.MaxTokens,
+		MaxTokens:    maxTokens,
 		Temperature:  temperature,
 		TopP:         topP,
 		TopK:         topK,
