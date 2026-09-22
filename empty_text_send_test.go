@@ -101,7 +101,7 @@ func TestSendInternal_EmptyText_SendsPendingUserTurn(t *testing.T) {
 	cancel()
 	conv.SetContext(ctx)
 
-	if _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil {
+	if _, _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil {
 		t.Fatal("expected a transport error from the cancelled request")
 	} else if strings.Contains(err.Error(), "cannot continue conversation") {
 		t.Fatalf("empty-text send of a pending user turn was rejected by the guard: %v", err)
@@ -115,7 +115,7 @@ func TestSendInternal_EmptyText_RejectsEmptyTrailingTurn(t *testing.T) {
 	conv.AddMessage(llmapi.RoleAssistant, "a1")
 	conv.AddRichMessage(llmapi.RoleUser, nil) // trailing user turn with no content, len 3 > 2
 
-	_, err := conv.sendInternal("", llmapi.Sampling{})
+	_, _, err := conv.sendInternal("", llmapi.Sampling{})
 	if err == nil || !strings.Contains(err.Error(), "cannot continue conversation") {
 		t.Fatalf("expected 'cannot continue conversation' for an empty trailing user turn, got: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSendInternal_EmptyText_AllowsToolResultTurn(t *testing.T) {
 	cancel()
 	conv.SetContext(ctx)
 
-	if _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil {
+	if _, _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil {
 		t.Fatal("expected a transport error from the cancelled request")
 	} else if strings.Contains(err.Error(), "cannot continue conversation") {
 		t.Fatalf("tool_result continuation was rejected by the guard: %v", err)
@@ -220,7 +220,7 @@ func TestSendInternal_EmptyText_RejectsOpenToolUseRequest(t *testing.T) {
 	cancel()
 	conv.SetContext(ctx)
 
-	if _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil || !strings.Contains(err.Error(), "cannot continue conversation") {
+	if _, _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil || !strings.Contains(err.Error(), "cannot continue conversation") {
 		t.Fatalf("expected 'cannot continue conversation' for empty text after an open tool_use request, got: %v", err)
 	}
 }
@@ -241,7 +241,7 @@ func TestSendInternal_EmptyText_ContinuesAfterAssistantResponse(t *testing.T) {
 	cancel()
 	conv.SetContext(ctx)
 
-	if _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil {
+	if _, _, err := conv.sendInternal("", llmapi.Sampling{}); err == nil {
 		t.Fatal("expected a transport error from the cancelled request")
 	} else if strings.Contains(err.Error(), "cannot continue conversation") {
 		t.Fatalf("empty text after a normal assistant turn must continue, not be rejected: %v", err)

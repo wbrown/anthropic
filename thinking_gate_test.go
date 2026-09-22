@@ -387,7 +387,7 @@ func TestSendStreaming_GatesThinkingByModel(t *testing.T) {
 }
 
 // TestSendRichStreaming_GatesThinkingByModel exercises the SendRichStreaming
-// path, which has its own local copy of the thinking-resolution block.
+// path.
 func TestSendRichStreaming_GatesThinkingByModel(t *testing.T) {
 	t.Run("opus-4-8 uses adaptive thinking", func(t *testing.T) {
 		var captured []byte

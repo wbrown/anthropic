@@ -253,7 +253,7 @@ func TestSendStreaming_GatesSamplingByModel(t *testing.T) {
 }
 
 // TestSendRichStreaming_GatesSamplingByModel exercises the SendRichStreaming
-// path, which has its own local copy of the sampling-resolution block.
+// path.
 func TestSendRichStreaming_GatesSamplingByModel(t *testing.T) {
 	t.Run("opus-4-8 omits all three", func(t *testing.T) {
 		var captured []byte
