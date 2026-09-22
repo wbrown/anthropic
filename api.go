@@ -488,54 +488,26 @@ func hasToolUseBlock(m *Message) bool {
 	return false
 }
 
-func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Response, error) {
-	if c.Settings == nil {
-		return nil, fmt.Errorf("conversation settings not set")
-	}
-	if c.ApiToken == "" {
-		return nil, fmt.Errorf("API token not set")
-	}
-	if text != "" {
-		c.AddMessage(llmapi.RoleUser, text)
-	} else if n := len(*c.Messages); n > 0 {
-		// Empty text means "send the conversation as it stands." Validate the trailing turn:
-		//   - assistant turn → continue (prefill), UNLESS it is an open tool_use request
-		//     (awaiting the client's tool_result); that can't be continued → reject, at any length.
-		//   - user turn with content (plain text or a tool_result) → respond → send, but only past
-		//     the opening exchange (the > 2 gate; the first user turn is a valid initial send).
-		//   - a user turn with no content (or any other trailing turn) → nothing to answer → reject.
-		lastMsg := (*c.Messages)[n-1]
-		if lastMsg.Role == "assistant" {
-			if hasToolUseBlock(lastMsg) {
-				return nil, fmt.Errorf("cannot continue conversation")
-			}
-		} else if n > 2 {
-			if !(lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0) {
-				return nil, fmt.Errorf("cannot continue conversation")
-			}
-		}
-	}
-
-	// Build system prompt with cache control if needed
+// buildMessages assembles the request body for the conversation as it stands:
+// the system prompt (as a cache-controlled block when SystemCacheable), the
+// thinking config, output_config and wire max_tokens the requested effort
+// resolves to, the sampling parameters the model and thinking mode admit, the
+// tools, and the history with the conversation-turn cache breakpoint applied.
+// stream marks a streaming request. Every send path builds its request here,
+// so the wire shape is one shape.
+func (c *Conversation) buildMessages(sampling llmapi.Sampling, stream bool) Messages {
 	var system interface{}
 	if c.System != nil && *c.System != "" {
 		if c.SystemCacheable {
-			// Use array format with cache control
 			system = []SystemPrompt{{
 				Type:         "text",
 				Text:         *c.System,
 				CacheControl: &CacheControl{Type: "ephemeral", TTL: "1h"},
 			}}
 		} else {
-			// Use simple string format
 			system = c.System
 		}
 	}
-
-	// Build tools with cache control if needed
-	tools := c.Tools
-	// Note: The API doesn't support caching individual tools, only the entire tools array
-	// Tool caching is handled at the API level, not per-tool
 
 	// resolveThinkingBudget is resolved before sampling because resolveSampling
 	// must know whether thinking is active: Anthropic rejects any explicit
@@ -554,10 +526,11 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	// (Claude Opus 4.7+; see supportsSampling) or whenever thinking is active.
 	temperature, topP, topK := resolveSampling(c.Settings, sampling, thinkingCfg.active())
 
-	// Apply conversation turn cache breakpoints before building the request
 	c.applyCacheBreakpoints()
 
-	messages := Messages{
+	// The API caches the tools array as a whole, never individual tools, so no
+	// per-tool cache control is applied here.
+	return Messages{
 		Model:        c.Settings.Model,
 		MaxTokens:    maxTokens,
 		Temperature:  temperature,
@@ -565,15 +538,50 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		TopK:         topK,
 		System:       system,
 		Messages:     c.Messages,
-		Tools:        tools,
+		Tools:        c.Tools,
 		Thinking:     thinkingCfg,
 		OutputConfig: outputCfg,
+		Stream:       stream,
 	}
+}
+
+// sendInternal validates the trailing turn, adds the user text (when
+// non-empty), sends the conversation as one non-streaming request, and returns
+// the parsed response beside the request as it went on the wire.
+func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Response, Messages, error) {
+	if c.Settings == nil {
+		return nil, Messages{}, fmt.Errorf("conversation settings not set")
+	}
+	if c.ApiToken == "" {
+		return nil, Messages{}, fmt.Errorf("API token not set")
+	}
+	if text != "" {
+		c.AddMessage(llmapi.RoleUser, text)
+	} else if n := len(*c.Messages); n > 0 {
+		// Empty text means "send the conversation as it stands." Validate the trailing turn:
+		//   - assistant turn → continue (prefill), UNLESS it is an open tool_use request
+		//     (awaiting the client's tool_result); that can't be continued → reject, at any length.
+		//   - user turn with content (plain text or a tool_result) → respond → send, but only past
+		//     the opening exchange (the > 2 gate; the first user turn is a valid initial send).
+		//   - a user turn with no content (or any other trailing turn) → nothing to answer → reject.
+		lastMsg := (*c.Messages)[n-1]
+		if lastMsg.Role == "assistant" {
+			if hasToolUseBlock(lastMsg) {
+				return nil, Messages{}, fmt.Errorf("cannot continue conversation")
+			}
+		} else if n > 2 {
+			if !(lastMsg.Role == "user" && lastMsg.Content != nil && len(*lastMsg.Content) > 0) {
+				return nil, Messages{}, fmt.Errorf("cannot continue conversation")
+			}
+		}
+	}
+
+	messages := c.buildMessages(sampling, false)
 
 	// Marshal messages to JSON
 	jsonData, marshalErr := json.Marshal(messages)
 	if marshalErr != nil {
-		return nil, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
+		return nil, Messages{}, fmt.Errorf("error marshalling to JSON: %s", marshalErr)
 	}
 
 	// Debug: Log request if ANTHROPIC_DEBUG is set
@@ -584,7 +592,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 	req, err := http.NewRequestWithContext(c.context(), "POST", c.endpoint(),
 		bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, fmt.Errorf("error creating HTTP request: %s", err)
+		return nil, Messages{}, fmt.Errorf("error creating HTTP request: %s", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.ApiToken)
@@ -602,7 +610,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		resp, httpErr = c.HttpClient.Do(req)
 		errCt++
 		if httpErr != nil && errCt > retries {
-			return nil, fmt.Errorf("http error: %s", httpErr)
+			return nil, Messages{}, fmt.Errorf("http error: %s", httpErr)
 		} else if httpErr == nil {
 			httpComplete = true
 		} else {
@@ -610,7 +618,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		}
 	}
 	if resp == nil {
-		return nil, fmt.Errorf("HTTP response is nil")
+		return nil, Messages{}, fmt.Errorf("HTTP response is nil")
 	}
 
 	defer func(Body io.ReadCloser) {
@@ -621,12 +629,12 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 
 	bodyBytes, bodyErr := io.ReadAll(resp.Body)
 	if bodyErr != nil {
-		return nil, fmt.Errorf("error reading response body: %s", bodyErr)
+		return nil, Messages{}, fmt.Errorf("error reading response body: %s", bodyErr)
 	}
 
 	// Check response status first
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, bodyBytes)
+		return nil, Messages{}, fmt.Errorf("API error (status %d): %s", resp.StatusCode, bodyBytes)
 	}
 
 	// Deserialize response
@@ -636,12 +644,12 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		bodyStr := string(bodyBytes)
 		if strings.HasPrefix(strings.TrimSpace(bodyStr), "<") {
 			// Likely an HTML error page
-			return nil, fmt.Errorf("received HTML error page from API (status %d)", resp.StatusCode)
+			return nil, Messages{}, fmt.Errorf("received HTML error page from API (status %d)", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("error unmarshaling JSON response: %s", jsonErr)
+		return nil, Messages{}, fmt.Errorf("error unmarshaling JSON response: %s", jsonErr)
 	}
 	if response.MessageType == "error" {
-		return nil, fmt.Errorf("API error: %s", bodyBytes)
+		return nil, Messages{}, fmt.Errorf("API error: %s", bodyBytes)
 	}
 
 	// Set tokens on all content blocks
@@ -649,7 +657,7 @@ func (c *Conversation) sendInternal(text string, sampling llmapi.Sampling) (*Res
 		(*response.Content)[i].tokens = response.Usage.OutputTokens
 	}
 
-	return &response, nil
+	return &response, messages, nil
 }
 
 // SendRich sends a message with rich content blocks.
@@ -660,7 +668,7 @@ func (c *Conversation) SendRich(content []llmapi.ContentBlock, sampling llmapi.S
 	}
 
 	// Call internal send directly to get full response
-	response, err := c.sendInternal("", sampling)
+	response, messages, err := c.sendInternal("", sampling)
 	if err != nil {
 		return nil, err
 	}
@@ -688,6 +696,9 @@ func (c *Conversation) SendRich(content []llmapi.ContentBlock, sampling llmapi.S
 	// Convert response content blocks to llmapi format
 	llmapiContent := fromAnthropicContentBlocks(*response.Content)
 
+	// The API's stop_reason is already the vocabulary StopReason uses, so the
+	// same word serves as the server's own finish reason. The usage block
+	// attributes no output tokens by channel, so the split stays unknown.
 	return &llmapi.RichResponse{
 		Content:                  llmapiContent,
 		StopReason:               response.StopReason,
@@ -695,6 +706,8 @@ func (c *Conversation) SendRich(content []llmapi.ContentBlock, sampling llmapi.S
 		OutputTokens:             response.Usage.OutputTokens,
 		CacheCreationInputTokens: response.Usage.CacheCreationInputTokens,
 		CacheReadInputTokens:     response.Usage.CacheReadInputTokens,
+		CompletionBudget:         messages.MaxTokens,
+		FinishReason:             response.StopReason,
 	}, nil
 }
 
@@ -711,52 +724,7 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		c.AddRichMessage(llmapi.RoleUser, content)
 	}
 
-	// Build system prompt with cache control if needed
-	var system interface{}
-	if c.System != nil && *c.System != "" {
-		if c.SystemCacheable {
-			system = []SystemPrompt{{
-				Type:         "text",
-				Text:         *c.System,
-				CacheControl: &CacheControl{Type: "ephemeral", TTL: "1h"},
-			}}
-		} else {
-			system = c.System
-		}
-	}
-
-	// resolveThinkingBudget is resolved before sampling because resolveSampling
-	// must know whether thinking is active: Anthropic rejects any explicit
-	// temperature/top_p/top_k the moment thinking is on, regardless of model.
-	// desired is the per-call output intent, defaulting to Settings.MaxTokens
-	// (the conversation's default desired output); the wire max_tokens adds the
-	// effective thinking mode's reasoning headroom on top.
-	desired := sampling.DesiredOutputTokens
-	if desired == 0 {
-		desired = c.Settings.MaxTokens
-	}
-	thinkingCfg, outputCfg, maxTokens := resolveThinkingBudget(c.Settings.Model, sampling.ReasoningEffort, desired)
-
-	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits
-	// them) or whenever thinking is active.
-	temperature, topP, topK := resolveSampling(c.Settings, sampling, thinkingCfg.active())
-
-	// Apply conversation turn cache breakpoints before building the request
-	c.applyCacheBreakpoints()
-
-	messages := Messages{
-		Model:        c.Settings.Model,
-		MaxTokens:    maxTokens,
-		Temperature:  temperature,
-		TopP:         topP,
-		TopK:         topK,
-		System:       system,
-		Messages:     c.Messages,
-		Tools:        c.Tools,
-		Thinking:     thinkingCfg,
-		OutputConfig: outputCfg,
-		Stream:       true,
-	}
+	messages := c.buildMessages(sampling, true)
 
 	jsonData, marshalErr := json.Marshal(messages)
 	if marshalErr != nil {
@@ -848,6 +816,9 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		c.CacheStats.TotalTokensSaved += (regularCost - cacheCost)
 	}
 
+	// The stream's stop_reason is already the vocabulary StopReason uses, so
+	// the same word serves as the server's own finish reason. The usage events
+	// attribute no output tokens by channel, so the split stays unknown.
 	return &llmapi.RichResponse{
 		Content:                  fromAnthropicContentBlocks(blocks),
 		StopReason:               stopReason,
@@ -855,6 +826,8 @@ func (c *Conversation) SendRichStreaming(content []llmapi.ContentBlock, sampling
 		OutputTokens:             outputTokens,
 		CacheCreationInputTokens: cacheCreationTokens,
 		CacheReadInputTokens:     cacheReadTokens,
+		CompletionBudget:         messages.MaxTokens,
+		FinishReason:             stopReason,
 	}, nil
 }
 
@@ -928,8 +901,9 @@ func (c *Conversation) GetCapabilities() llmapi.Capabilities {
 // message to the conversation. This is useful for continuing an incomplete
 // conversation by "assistant", in the case of a stopReason of "max_tokens".
 func (conversation *Conversation) Send(text string, sampling llmapi.Sampling) (reply, stopReason string, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int, err error) {
-	// Call internal send (it handles adding user message)
-	response, err := conversation.sendInternal(text, sampling)
+	// The seven-value contract carries no request account, so the request as
+	// sent is dropped here; SendRich carries it on the RichResponse.
+	response, _, err := conversation.sendInternal(text, sampling)
 	if err != nil {
 		return "", "", 0, 0, 0, 0, err
 	}
@@ -1031,52 +1005,7 @@ func (conversation *Conversation) SendStreaming(text string, sampling llmapi.Sam
 		}
 	}
 
-	// Build system prompt with cache control if needed
-	var system interface{}
-	if conversation.System != nil && *conversation.System != "" {
-		if conversation.SystemCacheable {
-			system = []SystemPrompt{{
-				Type:         "text",
-				Text:         *conversation.System,
-				CacheControl: &CacheControl{Type: "ephemeral", TTL: "1h"},
-			}}
-		} else {
-			system = conversation.System
-		}
-	}
-
-	// resolveThinkingBudget is resolved before sampling because resolveSampling
-	// must know whether thinking is active: Anthropic rejects any explicit
-	// temperature/top_p/top_k the moment thinking is on, regardless of model.
-	// desired is the per-call output intent, defaulting to Settings.MaxTokens
-	// (the conversation's default desired output); the wire max_tokens adds the
-	// effective thinking mode's reasoning headroom on top.
-	desired := sampling.DesiredOutputTokens
-	if desired == 0 {
-		desired = conversation.Settings.MaxTokens
-	}
-	thinkingCfg, outputCfg, maxTokens := resolveThinkingBudget(conversation.Settings.Model, sampling.ReasoningEffort, desired)
-
-	// Resolve sampling parameters, gated by model capability (Opus 4.7+ omits
-	// them) or whenever thinking is active.
-	temperature, topP, topK := resolveSampling(conversation.Settings, sampling, thinkingCfg.active())
-
-	// Apply conversation turn cache breakpoints before building the request
-	conversation.applyCacheBreakpoints()
-
-	messages := Messages{
-		Model:        conversation.Settings.Model,
-		MaxTokens:    maxTokens,
-		Temperature:  temperature,
-		TopP:         topP,
-		TopK:         topK,
-		System:       system,
-		Messages:     conversation.Messages,
-		Tools:        conversation.Tools,
-		Thinking:     thinkingCfg,
-		OutputConfig: outputCfg,
-		Stream:       true,
-	}
+	messages := conversation.buildMessages(sampling, true)
 
 	jsonData, marshalErr := json.Marshal(messages)
 	if marshalErr != nil {
